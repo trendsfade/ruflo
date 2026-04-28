@@ -579,6 +579,55 @@ export interface ClaudeFlowPlugin {
    * Optional plugin metadata
    */
   metadata?: Record<string, unknown>;
+
+  /**
+   * Declared permissions this plugin requires (CRIT-02)
+   */
+  readonly permissions?: PluginPermissions;
+
+  /**
+   * Plugin trust level determines sandbox enforcement (CRIT-02)
+   */
+  readonly trustLevel?: PluginTrustLevel;
+}
+
+/**
+ * Trust level determines how a plugin is isolated (CRIT-02)
+ */
+export type PluginTrustLevel = 'official' | 'verified' | 'community' | 'unverified';
+
+/**
+ * Declared permission capabilities for a plugin (CRIT-02)
+ */
+export interface PluginPermissions {
+  filesystem?: boolean;
+  network?: boolean;
+  env?: boolean;
+  process?: boolean;
+  memory?: boolean;
+  mcp?: boolean;
+  agents?: boolean;
+  cli?: boolean;
+}
+
+export const VALID_PERMISSION_KEYS = new Set<string>([
+  'filesystem', 'network', 'env', 'process', 'memory', 'mcp', 'agents', 'cli',
+]);
+
+export const DANGEROUS_PERMISSION_KEYS = new Set<string>([
+  'filesystem', 'network', 'env', 'process',
+]);
+
+export function validatePermissions(permissions: Record<string, unknown>): string[] {
+  const errors: string[] = [];
+  for (const [key, value] of Object.entries(permissions)) {
+    if (!VALID_PERMISSION_KEYS.has(key)) {
+      errors.push(`Unknown permission: '${key}'`);
+    } else if (typeof value !== 'boolean') {
+      errors.push(`Permission '${key}' must be a boolean, got ${typeof value}`);
+    }
+  }
+  return errors;
 }
 
 /**
@@ -660,4 +709,6 @@ export type PluginErrorCode =
   | 'CIRCULAR_DEPENDENCY'
   | 'INVALID_PLUGIN'
   | 'DUPLICATE_PLUGIN'
-  | 'HEALTH_CHECK_FAILED';
+  | 'HEALTH_CHECK_FAILED'
+  | 'PERMISSION_DENIED'
+  | 'SANDBOX_VIOLATION';

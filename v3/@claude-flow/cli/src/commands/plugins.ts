@@ -22,6 +22,15 @@ import {
 import { getPluginManager, type InstalledPlugin } from '../plugins/manager.js';
 import { getBulkRatings } from '../services/registry-api.js';
 
+// CRIT-02: Permission validation for plugin install
+const KNOWN_PLUGIN_PERMISSIONS = new Set([
+  'filesystem', 'network', 'env', 'process', 'memory',
+  'mcp', 'agents', 'cli', 'privileged', 'credentials', 'execute',
+]);
+const DANGEROUS_PLUGIN_PERMISSIONS = new Set([
+  'filesystem', 'network', 'env', 'process', 'privileged', 'credentials', 'execute',
+]);
+
 // List subcommand - Now uses IPFS-based registry
 const listCommand: Command = {
   name: 'list',
@@ -287,6 +296,26 @@ const installCommand: Command = {
 
         if (plugin) {
           spinner.setText(`Found ${plugin.displayName} v${plugin.version}`);
+
+          // CRIT-02: Validate plugin permissions on install
+          if (plugin.trustLevel !== 'official' && plugin.trustLevel !== 'verified') {
+            const unknownPerms = plugin.permissions.filter(
+              (p: string) => !KNOWN_PLUGIN_PERMISSIONS.has(p)
+            );
+            if (unknownPerms.length > 0) {
+              spinner.fail(`Plugin declares unknown permissions: ${unknownPerms.join(', ')}`);
+              return { success: false, exitCode: 1 };
+            }
+            const dangerousPerms = plugin.permissions.filter(
+              (p: string) => DANGEROUS_PLUGIN_PERMISSIONS.has(p)
+            );
+            if (dangerousPerms.length > 0) {
+              output.writeln(
+                output.highlight(`  Warning: requests sensitive permissions: ${dangerousPerms.join(', ')}`)
+              );
+              output.writeln(output.dim('  This plugin will run in a sandboxed environment.'));
+            }
+          }
         }
 
         spinner.setText(`Installing ${name} from npm...`);
