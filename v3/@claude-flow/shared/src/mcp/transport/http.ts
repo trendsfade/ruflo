@@ -473,7 +473,7 @@ export class HttpTransport extends EventEmitter implements ITransport {
     this.messagesReceived++;
 
     try {
-      const message = safeJsonParse(data);
+      const message = safeJsonParse<any>(data);
 
       if (message.jsonrpc !== '2.0') {
         ws.send(JSON.stringify({
@@ -509,7 +509,7 @@ export class HttpTransport extends EventEmitter implements ITransport {
       this.logger.error('WebSocket message error', { error });
 
       try {
-        const parsed = safeJsonParse(data);
+        const parsed = safeJsonParse<any>(data);
         ws.send(JSON.stringify({
           jsonrpc: '2.0',
           id: parsed.id || null,

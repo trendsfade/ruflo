@@ -169,7 +169,7 @@ export class StdioTransport extends EventEmitter implements ITransport {
     }
 
     try {
-      const message = safeJsonParse(line);
+      const message = safeJsonParse<any>(line);
       this.messagesReceived++;
 
       // Validate JSON-RPC format

@@ -432,7 +432,7 @@ export class HttpTransport extends EventEmitter implements ITransport {
     this.messagesReceived++;
 
     try {
-      const message = safeJsonParse(data);
+      const message = safeJsonParse<any>(data);
 
       if (message.jsonrpc !== '2.0') {
         ws.send(JSON.stringify({
