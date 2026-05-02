@@ -23,6 +23,7 @@
     "check:secrets": "bash scripts/check-secrets.sh",
     "check:handler-fallback": "tsx scripts/check-handler-fallback.mjs",
     "check:rvf-format": "tsx scripts/check-rvf-format.mjs",
+    "check:fn-security": "bash scripts/check-fn-security.sh",
     "check:audit": "npm audit --omit=dev --audit-level=critical",
     "check:audit:high": "npm audit --omit=dev --audit-level=high || echo '(non-blocking; see audit-known-issues.md)'",
     "postbuild": "bash scripts/check-secrets.sh"

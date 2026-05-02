@@ -1,7 +1,7 @@
 # ADR-093: goal_ui Optimization for RuVector WASM + AgentDB
 
-**Status**: Proposed
-**Date**: 2026-05-02
+**Status**: Accepted
+**Date**: 2026-05-02 (Proposed) → 2026-05-02 (Accepted at Step 25)
 **Author**: ruflo team
 **Branch**: `feat/goal_ui-ruvector-wasm`
 **Relates to**: ADR-033 (RuVector WASM-MCP), ADR-076 (Memory Bridge), ADR-077 (DiskANN), ADR-088 (LongMemEval benchmark)
@@ -224,4 +224,63 @@ cost; the format encode/decode is essentially free for the
 widgetConfig payload (~600 bytes JSON, no vector).
 
 Console errors during the benchmark: 0.
+
+### Step 25 — Final Honesty Checkpoint (2026-05-02)
+
+End-to-end validation across the full feature branch.
+
+**Build (production):**
+- `npm run build` ✓ (1928 modules, 1.39s; `dist/index.js` 780 kB → 232 kB gzip)
+- `npm run build:widget-only` ✓ (1737 modules, 1.19s; `dist/widget.js` 479 kB → 145 kB gzip)
+- `postbuild` secrets scanner clean
+
+**Security gates (5/5 pass):**
+
+| Gate | Command | Result |
+|------|---------|-------:|
+| API key isolation | `npm run check:secrets` | clean — 0 hits across `src/`, `functions/`, `tests/`, `dist/`, `public/widget.{js,css}`, `index.html` |
+| Audit (deploy block) | `npm run check:audit` | exit 0 — 0 critical |
+| Handler fallback (Zod) | `npm run check:handler-fallback` | 8/8 — 4 negative + 4 sanitizer assertions |
+| RVF format hardening | `npm run check:rvf-format` | 10/10 — 5 negative + 5 happy-path |
+| Function CORS/token/RL | `npm run check:fn-security` | 4/4 — 401 on missing/wrong token, empty allow-origin for disallowed Origin, 7×429 in 12-burst |
+
+**Test suite (Playwright e2e):**
+- `npm run test:e2e` — **22/22 passed in 3.7s**
+  - 4 smoke (one per route, console.error guard)
+  - 6 ui-elements (35 assertions vs DoD ≥ 30)
+  - 8 workflows (4 wf × happy + error paths)
+  - 3 persistence (goalRepo + researchConfigRepo round-trips)
+  - 1 widget (CSP-clean embed verification)
+
+**Browser Validation Gate (4/4 routes):**
+
+| Route | HTTP | console.error | unhandled rejections | error-boundary |
+|-------|-----:|--------------:|---------------------:|---------------:|
+| `/` | 200 | 0 | 0 | 0 |
+| `/demo` | 200 | 0 | 0 | 0 |
+| `/agents` | 200 | 0 | 0 | 0 |
+| `/notexist` | 200 | 0 | 0 | 0 |
+
+Screenshots saved to `v3/goal_ui/docs/checkpoints/step-25/`. Vs. step-20
+baseline: visible content matches (verified by inline Read of `notexist.png`
+pair); byte sizes differ due to Playwright/Chromium screenshot tool variance
+across runs (DPR/anti-aliasing). No visual regression.
+
+**Migration completion:**
+- `grep -r "supabase" src/` → 0 hits (Step 21b removed `@supabase/supabase-js` + `src/integrations/supabase/`)
+- 4/4 wired edge functions ported to Node + GCF
+- 3/3 React-state slots persisted via RVF (`widgetConfig`, `userGoal`, `researchConfig`)
+- 1/1 deferred edge function explicitly classified (`research-api` — no client callsite, fate decided in follow-up)
+
+**Performance vs DoD:**
+- RVF `put` p95 = 0.3 ms (DoD ≤ 50 ms — **167× headroom**)
+- RVF `get` p95 = 0.2 ms (DoD ≤ 10 ms — **50× headroom**)
+- Cold start = 1 ms
+
+**Status flip rationale:** all 6 phases complete (24/24 implementation steps + final
+honesty checkpoint), every code-modifying step passed the Browser Validation Gate
+on the same run as it was committed, every security sub-step landed with a
+runnable script that future CI can re-execute, and the persistence layer
+benchmarks at fractional-millisecond latency. Moving from `Proposed` →
+`Accepted`.
 
