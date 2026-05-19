@@ -1,10 +1,73 @@
-# ADR-123 — Sublinear-time-solver integration: signed, federatable PageRank as a RuFlo substrate primitive
+# ADR-123 — RuFlo Graph Intelligence Engine: real-time relationship intelligence with complexity-aware execution
 
 **Status**: Proposed (2026-05-18) — revised 2026-05-19 to track upstream `sublinear-time-solver@1.7.0`
 **Date**: 2026-05-18
 **Authors**: claude (drafted with rUv)
 **Related**: [`sublinear-time-solver@1.7.0`](https://www.npmjs.com/package/sublinear-time-solver) ([crates.io `sublinear@0.3.0`](https://crates.io/crates/sublinear), [github](https://github.com/ruvnet/sublinear-time-solver), [1.6.0 announcement gist](https://gist.github.com/ruvnet/342518ef950348c376bc7c04ffeb5337), [upstream `sublinear` ADR-001 "Complexity as Architecture"](https://github.com/ruvnet/sublinear-time-solver/blob/main/docs/adr/ADR-001-complexity-as-architecture.md)), [eleven-wedge research gist](https://gist.github.com/ruvnet/61d6d04af514b3c81ad0abf1e37fe116), ADR-103 (witness temporal history), ADR-104 (federation wire transport), ADR-105 (federation state snapshot), ADR-118 (AIDefence 2.3.0), ADR-121 (embeddings RuVector upgrade), ADR-122 (browser substrate). Library lineage: [Andoni–Krauthgamer–Pogrow ITCS 2019 (SDD sublinear)](https://arxiv.org/abs/1809.02995), [Kyng–Sachdeva FOCS 2016 (approx Cholesky)](https://rasmuskyng.com/research.html), [Asymmetric DD sublinear (2025)](https://arxiv.org/abs/2509.13891), [Friedkin–Johnsen application (2025)](https://arxiv.org/abs/2509.13112).
 **Supersedes**: nothing (additive)
+
+## Strategic positioning (the headline)
+
+RuFlo isn't shipping "a faster solver". It is committing to a new architectural stance:
+
+> **Intelligence that understands its own computational cost.**
+
+Traditional AI systems recompute everything. RuFlo only computes what changed enough to matter, only at the depth the runtime can afford, and only over the relationships that are still load-bearing.
+
+### The RuFlo Intelligence Stack (after ADR-123)
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Neural Layer  —  adaptive learning                                  │
+│  Trajectories • RL • ReasoningBank • SONA • EWC++                    │
+│  "What works, learned from experience"                               │
+├──────────────────────────────────────────────────────────────────────┤
+│  Graph Intelligence Layer  —  relationship reasoning   ←  ADR-123    │
+│  Causality • Trust • Influence • Dependencies • Blast-radius         │
+│  "What is connected to what, and by how much"                        │
+├──────────────────────────────────────────────────────────────────────┤
+│  Complexity Layer  —  runtime governance              ←  ADR-123     │
+│  Budget gates • Edge safety • Coherence checks • Delta-only updates  │
+│  "Compute only what the runtime can afford to compute"               │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+The three layers compose. Neural patterns nominate candidate decisions, graph intelligence scores their relationship impact, the complexity layer admits the work only if it fits the runtime's budget. **No competing system combines all three.**
+
+### Plain-language framing (for the README, not the architects)
+
+> RuFlo continuously reasons across agents, memory, infrastructure, workflows, and distributed systems while automatically adapting computation to available runtime budgets.
+
+| Technical primitive | Product positioning |
+|---|---|
+| Single-entry personalized PageRank | **Relationship intelligence** |
+| Sparse propagation / forward-push | **Continuous awareness** |
+| `solve_on_change(prev, delta)` | **Event-driven updates** |
+| `maxComplexityClass` budget gate | **Budget-aware intelligence** |
+| Witness-signed PR vectors | **Verifiable reasoning** |
+| `coherence_score` rejection | **Stability monitoring** |
+| Streaming delta propagation | **Live adaptive reasoning** |
+
+### Why this matters operationally
+
+Every team running agents has hit one or more of these:
+
+- cost overruns from runaway compute
+- runaway agents that don't know when to stop
+- browser UIs that freeze on heavy reasoning
+- edge / battery / Pi-class devices that can't afford full graphs
+- federation peers that can't negotiate compute budgets
+- distributed systems where state changes faster than full re-solves can complete
+
+ADR-123 commits to treating **complexity as a runtime contract**, not an academic property. `maxComplexityClass` is computational QoS for intelligence systems — agents request bounded computation, edge devices reject unsafe workloads, browsers stay responsive, federation peers negotiate budgets. The contract is enforced by the solver itself (upstream 1.7.0 `Complexity` trait), not by hopeful retry-and-cancel scaffolding.
+
+### Self-regulating cognition infrastructure
+
+Adding complexity classes + coherence gates + incremental deltas + streaming updates is not a performance optimisation. It is a category move: from *graph-accelerated agent* to *self-regulating cognition infrastructure*. The substrate now knows what it's spending, what it's stable on, and what it changed since the last tick. Everything else in ADR-123 (the eleven wedges, the signed PR artifact, the federation distribution) flows from that stance.
+
+The rest of this document is the technical commitment — five SOTA axes surveyed, the eleven RuFlo graphs catalogued, the architecture diagrammed, an eight-phase rollout, and seven open questions. Lead from the layered story above; the layers are the architecture, not just the marketing.
+
+---
 
 ## Upstream version update (2026-05-19 revision)
 
@@ -22,11 +85,15 @@ Test counts updated: upstream 137 → 151 (lib only) at 1.7.0; full matrix 148/1
 
 ## Core thesis (beyond-SOTA wedge, stated first)
 
-RuFlo is the only agent platform in the field that already ships **Ed25519-signed witness chains** (ADR-103), **portable RVF cognitive containers** (`@ruvector/rvf@0.2.1`), and a **federated peer mesh with budgeted transport** (ADR-104/105/111). Layer `sublinear-time-solver@1.6.0` on top of that substrate and RuFlo gains a capability that LangGraph, AutoGen, Letta, MemGPT, Mem0, HippoRAG, and every browser-agent vendor structurally cannot produce: **signed, replayable, federatable personalized-PageRank artifacts**.
+The strategic frame above ("complexity as a runtime contract") is the *product* claim. This section names the *architectural* moat that makes it credible.
+
+RuFlo is the only agent platform in the field that already ships **Ed25519-signed witness chains** (ADR-103), **portable RVF cognitive containers** (`@ruvector/rvf@0.2.1`), and a **federated peer mesh with budgeted transport** (ADR-104/105/111). Layer `sublinear-time-solver@1.7.0` on top of that substrate and RuFlo gains a capability that LangGraph, AutoGen, Letta, MemGPT, Mem0, HippoRAG, and every browser-agent vendor structurally cannot produce: **signed, replayable, federatable, complexity-budgeted, coherence-gated personalized-PageRank artifacts**.
 
 A signed PR artifact is a single small object that says:
 
-> "Installation A, witness key X, computed personalized PageRank π over graph G at timestamp T, with α=0.85, ε=10⁻³, using single-entry forward-push at row r. Vector hash H. Signature S over (X, T, G-id, α, ε, r, H)."
+> "Installation A, witness key X, computed personalized PageRank π over graph G at timestamp T, with α=0.85, ε=10⁻³, using single-entry forward-push at row r, in complexity class `Adaptive { Logarithmic, Linear }`, at coherence margin 0.42. Vector hash H. Signature S over (X, T, G-id, α, ε, r, class, coherence, H)."
+
+The artifact carries not just the *result* but the *cost class it was computed at* and the *stability margin of the input*. Federation peers receiving the artifact can verify all three: the signature (provenance), the complexity class (budget compliance — "this won't blow up my runtime if I replay it"), and the coherence margin (stability — "the math was well-defined on this input"). That is what "verifiable reasoning" actually means.
 
 Federation peers can request this object instead of re-walking the graph. A peer that trusts X's witness key can use π directly. A peer that doesn't can verify the structure, replay the computation locally (single-entry forward-push at `r` over the *same* G is deterministic given α, ε), and confirm the byte-for-byte hash. The provenance moat from ADR-122 (signed browser trajectories) generalizes to signed graph-reasoning vectors — every PageRank over a causal graph, every transitive-trust closure, every cost-attribution roll-up, every blast-radius score becomes a verifiable, portable artifact rather than an ephemeral local computation.
 
@@ -99,6 +166,31 @@ The research gist enumerates eleven plugins whose internals are graph computatio
 | **12** | **streaming subset of wedges 1, 3, 6, 7, 10** (browser causal break appends, federation trust deltas, cost-tracker spend events, observability span streams, AIDefence flag updates) — added in 2026-05-19 revision | **any wedge with append-only event input** | **`A·dx = delta` via `solve_on_change`** | **upstream 1.7.0 `IncrementalSolver` trait** | **O(log N) per event but full-cost vector materialisation each tick** | **O(nnz(delta) · log N) per event — pays only for the change** |
 
 Cross-cutting addendum from the gist: `@claude-flow/embeddings` currently ships a hand-rolled Johnson–Lindenstrauss projection with a documented dimension bug. `sublinear-time-solver@1.7.0` ships a hardened JL with the `target_dim ≤ n−1` cap correctly enforced (Achlioptas / Dasgupta–Gupta constant). This is a correctness fix, not a performance fix, and closes the [ADR-121](./ADR-121-embeddings-ruvector-upgrade.md) Phase 4 follow-up.
+
+### Core capabilities the substrate gains
+
+Mapping the twelve wedges into the product-positioning vocabulary from the strategic-positioning section:
+
+- **Real-time root-cause analysis** — single-entry PageRank over the browser causal-recovery graph (W1) and the observability span graph (W7)
+- **Trust propagation** — federation peer trust closure (W3) + AIDefence suspicion propagation (W10)
+- **Change-impact analysis** — jujutsu file-import blast-radius (W11)
+- **Continuous workflow awareness** — MCTS branch global-value augment (W2)
+- **Adaptive memory reasoning** — knowledge graph importance (W4) + Graph-RAG personalized retrieval (W5)
+- **Federated graph intelligence** — Phase 8 signed PR artifact distribution
+- **Streaming event propagation** — Wedge 12 (`solve_on_change` over federation deltas, span streams, append-only causal breaks, cost spend events, AIDefence flag updates)
+- **Complexity-aware execution** — `maxComplexityClass` budget gate, threaded through every MCP tool
+- **Verifiable reasoning artifacts** — Phase 7 witness-signed PR vectors with embedded `complexity_class` + `coherence_score`
+
+### Built for
+
+- Autonomous agents (`@claude-flow/browser` substrate, ADR-122)
+- Browser automation (the ADR-122 stack: Stagehand / Browser Use / Playwright targets)
+- AI infrastructure (`@claude-flow/*` monorepo)
+- Observability platforms (`ruflo-observability`)
+- Security systems (`ruflo-aidefence` + `ruflo-security-audit`)
+- Distributed memory (`ruflo-agentdb` + `ruflo-rag-memory` + `@claude-flow/memory`)
+- Edge AI (`is_edge_safe()` gate on every MCP call)
+- AIoT systems (`ruflo-iot-cognitum` device-coordinator + telemetry-analyzer)
 
 ## Architecture
 
