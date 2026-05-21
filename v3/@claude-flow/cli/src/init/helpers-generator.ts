@@ -6,6 +6,14 @@
 import type { InitOptions } from './types.js';
 import { generateStatuslineScript, generateStatuslineHook } from './statusline-generator.js';
 
+// ADR-127 Phase 4 — attribution is opt-in (#1670 / #2089).
+// When the user passes --attribution (options.attribution === true),
+// this footer is available for injection into generated content such as
+// PR body templates and release notes.  It is NEVER hard-wired into the
+// static command-file templates — those are user-owned content.
+export const ATTRIBUTION_FOOTER =
+  '🤖 Generated with [RuFlo](https://github.com/ruvnet/ruflo)';
+
 /**
  * Generate pre-commit hook script
  */
@@ -1192,6 +1200,14 @@ export function generateHelpers(options: InitOptions): Record<string, string> {
     // Windows-specific scripts
     helpers['daemon-manager.ps1'] = generateWindowsDaemonManager();
     helpers['daemon-manager.cmd'] = generateWindowsBatchWrapper();
+
+    // ADR-127 Phase 4 — expose the attribution footer as a helper file only
+    // when the user explicitly opts in. The file content is the single-line
+    // string so init-generated PR templates can `cat .claude/helpers/attribution`
+    // and append it conditionally without hard-wiring the string everywhere.
+    if (options.attribution === true) {
+      helpers['attribution'] = ATTRIBUTION_FOOTER + '\n';
+    }
   }
 
   if (options.components.statusline) {

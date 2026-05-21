@@ -839,8 +839,9 @@ npx ruv-swarm github review-coordinate \
 Updates will be posted automatically by swarm agents during implementation.
 
 ---
-🤖 Generated with Claude Code
 ```
+
+<!-- last-updated: 2026-05-21 — ADR-127 -->
 
 ### Bug Report Template
 
@@ -878,7 +879,6 @@ Updates will be posted automatically by swarm agents during implementation.
 - **Tester**: Validation and testing
 
 ---
-🤖 Generated with Claude Code
 ```
 
 ### Feature Request Template
@@ -922,7 +922,6 @@ Updates will be posted automatically by swarm agents during implementation.
 - **Documenter**: Documentation
 
 ---
-🤖 Generated with Claude Code
 ```
 
 ### Swarm Task Template

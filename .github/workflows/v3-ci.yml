@@ -90,6 +90,7 @@ on:
       - 'scripts/smoke-github-safe-injection.mjs'
       - 'scripts/smoke-github-actions-pins.mjs'
       - 'scripts/smoke-deprecated-actions.mjs'
+      - 'scripts/smoke-attribution-opt-in.mjs'
       - '.github/supply-chain/allowed-deps.json'
   pull_request:
     branches: [main, develop]
@@ -157,6 +158,7 @@ on:
       - 'scripts/smoke-github-safe-injection.mjs'
       - 'scripts/smoke-github-actions-pins.mjs'
       - 'scripts/smoke-deprecated-actions.mjs'
+      - 'scripts/smoke-attribution-opt-in.mjs'
       - '.github/supply-chain/allowed-deps.json'
       # witness manifests / fix list — so witness-verify runs on PRs that
       # touch them (otherwise a stale per-OS manifest only fails post-merge).
@@ -1081,6 +1083,34 @@ jobs:
 
       - name: Run deprecated-actions smoke
         run: node scripts/smoke-deprecated-actions.mjs
+
+  github-attribution-opt-in-smoke:
+    # Regression guard for ruvnet/ruflo#2089 — ADR-127 Phase 4.
+    #
+    # Phase 4 removes hardcoded "Generated with Claude Code" attribution
+    # strings from the static github command templates. Attribution is now
+    # opt-in via --attribution / options.attribution=true (#1670 / #2089).
+    # Hard-wired footers silently added a third-party Co-Authored-By line
+    # to every user's commits and were impossible to undo without rewriting
+    # git history.
+    #
+    # This smoke scans the same three trees as the pins smoke and fails if
+    # the "Generated with" emoji pattern reappears — preventing copy-paste
+    # regression from blog posts or AI-generated snippets.
+    name: github attribution opt-in smoke (#2089, ADR-127 Phase 4)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run attribution opt-in smoke
+        run: node scripts/smoke-attribution-opt-in.mjs
 
   pre-bash-hook-smoke:
     # Regression guard for ruvnet/ruflo#2017 — the `pre-bash` PreToolUse hook
