@@ -4442,7 +4442,7 @@ export const hooksTeammateIdle: MCPTool = {
 
 export const hooksTaskCompleted: MCPTool = {
   name: 'hooks_task-completed',
-  description: 'Agent Teams hook — fired when a task is marked complete. Records the completion and, when `trainPatterns:true`, feeds the outcome to the SONA + EWC++ learning pipeline (the same path used by hooks_intelligence trajectory-*). Multiple ways to drive learning exist: (a) call this with trainPatterns:true for a one-step trajectory, (b) use hooks_intelligence trajectory-start/step/end for richer multi-step learning, (c) just record an episode via memory_store if no learning is needed. Each path is honest about what it persists; check the returned `learningPath` field.',
+  description: 'Agent Teams hook — fired when a task is marked complete. Records the completion and, when `trainPatterns:true`, feeds the outcome to the SONA + EWC++ learning pipeline (the same path used by hooks_intelligence trajectory-*). Multiple ways to drive learning exist: (a) call this with trainPatterns:true for a one-step trajectory, (b) use hooks_intelligence trajectory-start/step/end for richer multi-step learning, (c) just record an episode via memory_store if no learning is needed. Each path is honest about what it persists; check the returned `learningPath` field. Use when native TaskUpdate(status:completed) is wrong because the runtime also needs to (i) record the outcome as a learning signal and (ii) emit the standard "task done" pipeline event — TaskUpdate only changes the task row.',
   category: 'hooks',
   inputSchema: {
     type: 'object',
@@ -4534,7 +4534,7 @@ export const hooksTaskCompleted: MCPTool = {
  */
 export const hooksIntelligenceUnifiedStats: MCPTool = {
   name: 'hooks_intelligence_unified-stats',
-  description: 'One honest view across the four learning stat sources: globalStats (`.claude-flow/neural/stats.json`), the in-memory SONA coordinator, memory-bridge AgentDB entries, and the neural-patterns store. Each sub-view names its source path. The `consistency` block notes cross-store drift (e.g. globalStats reports N patterns but neural_patterns is empty). Use this when one dashboard call should show "did learning happen" coherently — vs the four original aggregators which each return only their narrow slice. See ADR-075.',
+  description: 'One honest view across the four learning stat sources: globalStats (`.claude-flow/neural/stats.json`), the in-memory SONA coordinator, memory-bridge AgentDB entries, and the neural-patterns store. Each sub-view names its source path. The `consistency` block notes cross-store drift (e.g. globalStats reports N patterns but neural_patterns is empty). See ADR-075. Use when calling the four narrow aggregators (`hooks_intelligence stats`, `memory_stats`, `neural_status`, the SONA coordinator getter) one at a time is wrong because they each see only their own slice and cross-store drift goes silent — this tool surfaces that drift in the `consistency` block, which the narrow APIs cannot.',
   category: 'hooks',
   inputSchema: {
     type: 'object',

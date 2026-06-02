@@ -105,19 +105,22 @@ const INVARIANTS = [
   {
     issue: '#1951',
     file: 'v3/@claude-flow/cli/.claude/helpers/statusline.cjs',
-    substring: '.claude/plugins/marketplaces/ruflo',
+    // Regex matches the path.join(home, '.claude', 'plugins', 'marketplaces', 'ruflo', …) form.
+    // The original substring form happened to hit because of a comment in the v3 snapshot,
+    // not the actual code path; switch to a regex that catches the real call site.
+    regex: /['"]marketplaces['"]\s*,\s*['"]ruflo['"]/,
     why: 'Plugin-install candidate path probed first — without it, plugin users always fall through to the hardcoded default.',
   },
   {
     issue: '#1951',
     file: '.claude/helpers/statusline.cjs',
-    substring: '.claude/plugins/marketplaces/ruflo',
+    regex: /['"]marketplaces['"]\s*,\s*['"]ruflo['"]/,
     why: 'Same plugin-install candidate in the root statusline copy.',
   },
   {
     issue: '#1951',
     file: 'v3/@claude-flow/cli/src/init/statusline-generator.ts',
-    substring: '.claude/plugins/marketplaces/ruflo',
+    regex: /['"]marketplaces['"]\s*,\s*['"]ruflo['"]/,
     why: 'Same plugin-install candidate in the init template that generates project-local statuslines.',
   },
 
@@ -143,20 +146,22 @@ const INVARIANTS = [
     why: 'Daemon launcher forwards --headless — same family as the --workers gap.',
   },
 
-  // #1989 — statusline guards SQLite header read against RFE1-encrypted
-  // memory.db (the bug rendered 3.3B `patterns` and cascaded into fake
-  // DDD 5/5 / 100% / 🧠 100%).
+  // #1989 — statusline previously guarded raw SQLite header reads against
+  // RFE1-encrypted memory.db (the bug rendered 3.3B `patterns` and cascaded
+  // into fake DDD 5/5 / 100% / 🧠 100%). Superseded by #2196's delegation
+  // refactor: statusline-generator.ts no longer reads .swarm/memory.db
+  // bytes directly — it delegates to `hooks-statusline --json`, which
+  // queries AgentDB via the typed SDK and never touches raw SQLite pages.
+  // The regression vector is closed by ARCHITECTURE: if a future refactor
+  // reintroduces raw-bytes reading from a memory.db path, the #2196 guard
+  // (presence of the delegation pattern) catches it before the SQLite
+  // magic-check would ever be relevant. See ruvnet/ruflo#2216 for the
+  // user-deployed (pre-#2196) statusline still having the bug.
   {
-    issue: '#1989',
+    issue: '#2196',
     file: 'v3/@claude-flow/cli/src/init/statusline-generator.ts',
-    substring: "Buffer.from('SQLite format 3",
-    why: 'Magic-bytes check before reading SQLite page count. Without it, encrypted RFE1 memory.db files produce bogus uint32 pattern counts.',
-  },
-  {
-    issue: '#1989',
-    file: 'v3/@claude-flow/cli/src/init/statusline-generator.ts',
-    regex: /pageCount > 1_000_000/,
-    why: 'Sanity clamp rejecting >1M-page DBs (~4GB). Defense-in-depth even on plaintext SQLite.',
+    regex: /hooks[- ]statusline|hooksStatusline/,
+    why: 'Statusline-generator must delegate to hooks-statusline rather than re-implementing memory.db readers (#2195/#1989 supersession). Without delegation, the regenerated statusline.cjs goes back to raw-bytes reading which broke for encrypted RFE1 DBs.',
   },
 
   // #1987 — memory stats uses persistent HNSW count from MCP tool, not
