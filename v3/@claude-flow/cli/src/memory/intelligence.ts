@@ -1148,31 +1148,23 @@ export async function recordTrajectory(
       }
     }
 
-    // Forward trajectory to @ruvector/ruvllm SonaCoordinator if available.
-    // #2312 — set CLAUDE_FLOW_SKIP_RUVLLM_TRAJECTORY=1 to bypass this branch.
-    // The ruvllm SonaCoordinator's recordTrajectory currently allocates GB-scale
-    // during its first SONA adapt step, which OOMs CI smokes (heap 6 GB+). The
-    // env-var lets graph-edge smokes assert their contract without dragging in
-    // the heavy ML path; production keeps the default path. A try/catch can't
-    // rescue this because JS heap OOM aborts the process — guard before the call.
-    if (!process.env.CLAUDE_FLOW_SKIP_RUVLLM_TRAJECTORY) {
-      const ruvllmCoord = await loadRuvllmCoordinator();
-      if (ruvllmCoord) {
-        try {
-          const avgQuality = verdict === 'success' ? 1.0 : verdict === 'partial' ? 0.5 : 0.0;
-          ruvllmCoord.recordTrajectory({
-            steps: enrichedSteps.map(s => ({
-              state: s.content,
-              action: s.type,
-              reward: avgQuality,
-              embedding: s.embedding || []
-            })),
-            totalReward: avgQuality,
-            success: verdict === 'success'
-          });
-        } catch {
-          // ruvllm recording failed silently
-        }
+    // Forward trajectory to @ruvector/ruvllm SonaCoordinator if available
+    const ruvllmCoord = await loadRuvllmCoordinator();
+    if (ruvllmCoord) {
+      try {
+        const avgQuality = verdict === 'success' ? 1.0 : verdict === 'partial' ? 0.5 : 0.0;
+        ruvllmCoord.recordTrajectory({
+          steps: enrichedSteps.map(s => ({
+            state: s.content,
+            action: s.type,
+            reward: avgQuality,
+            embedding: s.embedding || []
+          })),
+          totalReward: avgQuality,
+          success: verdict === 'success'
+        });
+      } catch {
+        // ruvllm recording failed silently
       }
     }
 
