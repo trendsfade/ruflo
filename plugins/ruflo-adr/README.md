@@ -50,11 +50,36 @@ proposed --> accepted --> deprecated
 
 Relationships tracked as causal edges: `supersedes`, `amends`, `depends-on`, `related`.
 
+## Compatibility
+
+- **CLI:** pinned to `@claude-flow/cli` v3.6 major+minor.
+- **Verification:** `bash plugins/ruflo-adr/scripts/smoke.sh` is the contract.
+
+## Namespace coordination
+
+This plugin owns the `adr-patterns` AgentDB namespace. It defers to [ruflo-agentdb ADR-0001 §"Namespace convention"](../ruflo-agentdb/docs/adrs/0001-agentdb-optimization.md) for naming rules. Reserved namespaces (`pattern`, `claude-memories`, `default`) MUST NOT be shadowed.
+
+`adr-patterns` follows kebab-case `<plugin-stem>-<intent>` per the convention. The plugin uses it for semantic ADR search and for cross-project pattern transfer (via `hooks_transfer` in `ruflo-intelligence`).
+
+## Verification
+
+```bash
+bash plugins/ruflo-adr/scripts/smoke.sh
+# Expected: "10 passed, 0 failed"
+```
+
+## Architecture Decisions
+
+- [`ADR-0001` — ruflo-adr plugin contract (pinning, namespace coordination, smoke as contract)](./docs/adrs/0001-adr-plugin-pattern.md)
+
 ## Related Plugins
 
-- `ruflo-ddd` -- Document domain decisions as ADRs
-- `ruflo-sparc` -- Architecture phase (Phase 3) produces ADRs
-- `ruflo-migrations` -- Schema change decisions recorded as ADRs
+- `ruflo-agentdb` — namespace convention owner; backing store for the ADR graph
+- `ruflo-ddd` — document domain decisions as ADRs
+- `ruflo-sparc` — Architecture phase (Phase 3) produces ADRs
+- `ruflo-migrations` — schema change decisions recorded as ADRs
+- `ruflo-jujutsu` — ADR-aware diff analysis on PRs
+- `ruflo-intelligence` — `hooks_transfer` ships ADR patterns across projects
 
 ## License
 

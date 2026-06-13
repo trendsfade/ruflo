@@ -35,14 +35,23 @@ import { githubTools } from './mcp-tools/github-tools.js';
 import { daaTools } from './mcp-tools/daa-tools.js';
 import { coordinationTools } from './mcp-tools/coordination-tools.js';
 import { browserTools } from './mcp-tools/browser-tools.js';
+import { browserSessionTools } from './mcp-tools/browser-session-tools.js';
 import { execFileSync } from 'node:child_process';
 // Phase 6: AgentDB v3 controller tools
 import { agentdbTools } from './mcp-tools/agentdb-tools.js';
 // RuVector WASM tools
 import { ruvllmWasmTools } from './mcp-tools/ruvllm-tools.js';
 import { wasmAgentTools } from './mcp-tools/wasm-agent-tools.js';
+// ADR-115: Anthropic Claude Managed Agents — a cloud agent runtime alongside
+// the local WASM-sandboxed `wasm_agent_*` (rvagent) tools. Lives in the
+// `ruflo-agent` plugin.
+import { managedAgentTools } from './mcp-tools/managed-agent-tools.js';
 import { guidanceTools } from './mcp-tools/guidance-tools.js';
 import { autopilotTools } from './mcp-tools/autopilot-tools.js';
+// #1916: coverage-aware routing tools — defined in ruvector/coverage-tools.ts
+// but were never registered, so the `ruflo hooks coverage-*` CLI subcommands
+// failed with `Tool not found: hooks_coverage-route`.
+import { coverageRouterTools } from './ruvector/coverage-tools.js';
 
 // #1605: Only register browser tools if agent-browser is available
 let _browserAvailable: boolean | null = null;
@@ -56,6 +65,16 @@ function getBrowserTools(): MCPTool[] {
     }
   }
   return _browserAvailable ? browserTools : [];
+}
+
+/**
+ * Lifecycle MCP tools for ruflo-browser session-as-skill architecture
+ * (ADR-0001 ruflo-browser §7). Always registered: their handlers shell out
+ * to ruvector + agent-browser + claude-flow memory and degrade gracefully
+ * when those CLIs are missing.
+ */
+function getBrowserSessionTools(): MCPTool[] {
+  return browserSessionTools;
 }
 
 /**
@@ -97,15 +116,20 @@ registerTools([
   ...daaTools,
   ...coordinationTools,
   ...getBrowserTools(),
+  ...getBrowserSessionTools(),
   // Phase 6: AgentDB v3 controller tools
   ...agentdbTools,
   // RuVector WASM tools
   ...ruvllmWasmTools,
   ...wasmAgentTools,
+  // ADR-115: Anthropic Claude Managed Agents (cloud agent runtime)
+  ...managedAgentTools,
   // Guidance & discovery tools
   ...guidanceTools,
   // Autopilot persistent completion tools
   ...autopilotTools,
+  // #1916: coverage-aware routing (hooks_coverage-route / -suggest / -gaps)
+  ...coverageRouterTools,
 ]);
 
 /**
@@ -164,7 +188,13 @@ export async function callMCPTool<T = unknown>(
   try {
     // Call the tool handler
     const result = await tool.handler(input, context);
-    return result as T;
+    // ADR-146 P2: scan every tool result for indirect-injection before it
+    // returns to the caller. The screen is opt-in via env (default off in
+    // 3.10.34 — flip to default in v4) so existing pipelines keep their
+    // exact behaviour while the call site is exercised by tests and
+    // adopters. Telemetry from the screen lands in the shared
+    // GuardrailEvent sink (P5).
+    return applyContentBoundaryGuardrail(toolName, result) as T;
   } catch (error) {
     // Wrap and re-throw with context
     throw new MCPClientError(
@@ -173,6 +203,68 @@ export async function callMCPTool<T = unknown>(
       error instanceof Error ? error : undefined
     );
   }
+}
+
+/**
+ * ADR-146 P2 — content-boundary screen on the MCP tool dispatch path.
+ *
+ * Default behaviour (3.10.34, legacy mode): returns the result unchanged.
+ * With `CLAUDE_FLOW_STRICT_GUARDRAIL=true`, scans every string field of the
+ * result; `reject` substitutes the field with a typed marker so the caller
+ * can surface the rejection. The class itself (`ToolOutputGuardrail`)
+ * shipped in ADR-131 P1; this call site is what closes #2149.
+ *
+ * Implementation note: we resolve the guardrail lazily so the cold-import
+ * cost of `@claude-flow/security` does not hit every CLI invocation. Once
+ * P5 wires structured telemetry, this also publishes a `GuardrailEvent`.
+ */
+let _guardrailInstance: { scanAndEnforce: (s: string) => { content: string; action: string; result: { severity: string; category: string; pattern: string } } } | null = null;
+function applyContentBoundaryGuardrail(toolName: string, result: unknown): unknown {
+  if (process.env.CLAUDE_FLOW_STRICT_GUARDRAIL !== 'true') return result;
+  if (typeof result !== 'object' || result === null) return result;
+
+  // Lazy-resolve the guardrail singleton to avoid hot-path import cost.
+  if (_guardrailInstance === null) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const sec = require('@claude-flow/security') as {
+        createToolOutputGuardrail?: (cfg?: unknown) => typeof _guardrailInstance;
+      };
+      if (sec?.createToolOutputGuardrail) {
+        _guardrailInstance = sec.createToolOutputGuardrail();
+      } else {
+        return result; // module shape unexpected — fail open
+      }
+    } catch {
+      return result; // security package not installed in this consumer — fail open
+    }
+  }
+
+  const guardrail = _guardrailInstance;
+  if (!guardrail) return result;
+
+  // Walk the result object one level deep. We do not deeply traverse because
+  // most tool results are flat record shapes; deep recursion would change the
+  // p99 latency contract. Hot strings tend to live at the top level.
+  const out: Record<string, unknown> = {};
+  let mutated = false;
+  for (const [k, v] of Object.entries(result as Record<string, unknown>)) {
+    if (typeof v === 'string' && v.length > 0) {
+      const decision = guardrail.scanAndEnforce(v);
+      if (decision.action === 'reject') {
+        out[k] = `<rejected-by-guardrail tool=${JSON.stringify(toolName)} category=${decision.result.category}>`;
+        mutated = true;
+        continue;
+      }
+      if (decision.action === 'redact') {
+        out[k] = decision.content;
+        mutated = true;
+        continue;
+      }
+    }
+    out[k] = v;
+  }
+  return mutated ? out : result;
 }
 
 /**

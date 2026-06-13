@@ -119,6 +119,18 @@ export class CommandParser {
     this.lazyCommandNames.add(name);
   }
 
+  /**
+   * #1791.2 — true when `name` is a lazy command that hasn't been promoted
+   * to a fully registered Command yet. The CLI uses this to eagerly load
+   * the module before parsing so its subcommand flags (e.g. `-d` for
+   * `hive-mind task --description`) are scoped into the alias map. Without
+   * this, lazy commands' short flags silently fall through to global
+   * resolution and the action handler sees an empty `flags.description`.
+   */
+  isLazyOnly(name: string): boolean {
+    return this.lazyCommandNames.has(name) && !this.commands.has(name);
+  }
+
   private isKnownCommandName(name: string): boolean {
     return this.commands.has(name) || this.lazyCommandNames.has(name);
   }
@@ -285,8 +297,17 @@ export class CommandParser {
         const normalizedKey = this.normalizeKey(key);
 
         if (booleanFlags.has(normalizedKey)) {
-          flags[normalizedKey] = true;
-        } else if (nextIndex < args.length && !args[nextIndex].startsWith('-')) {
+          // #explore-flag: allow an explicit boolean value (`--explore false`,
+          // `--explore true`). Without this, a default-true boolean could never
+          // be disabled via the space form — the value was dropped and the flag
+          // forced to true. The `=` form already worked via parseValue.
+          if (nextIndex < args.length && this.isBooleanLiteral(args[nextIndex])) {
+            flags[normalizedKey] = args[nextIndex].toLowerCase() === 'true';
+            nextIndex++;
+          } else {
+            flags[normalizedKey] = true;
+          }
+        } else if (nextIndex < args.length && this.isFlagValue(args[nextIndex])) {
           flags[normalizedKey] = this.parseValue(args[nextIndex]);
           nextIndex++;
         } else {
@@ -303,8 +324,15 @@ export class CommandParser {
         const normalizedKey = this.normalizeKey(key);
 
         if (booleanFlags.has(normalizedKey)) {
-          flags[normalizedKey] = true;
-        } else if (nextIndex < args.length && !args[nextIndex].startsWith('-')) {
+          // #explore-flag: short boolean flags also accept an explicit value
+          // (`-e false`) so a default-true boolean can be turned off.
+          if (nextIndex < args.length && this.isBooleanLiteral(args[nextIndex])) {
+            flags[normalizedKey] = args[nextIndex].toLowerCase() === 'true';
+            nextIndex++;
+          } else {
+            flags[normalizedKey] = true;
+          }
+        } else if (nextIndex < args.length && this.isFlagValue(args[nextIndex])) {
           flags[normalizedKey] = this.parseValue(args[nextIndex]);
           nextIndex++;
         } else {
@@ -320,6 +348,35 @@ export class CommandParser {
     }
 
     return { flags, nextIndex };
+  }
+
+  /**
+   * Decide whether `arg` should be consumed as the VALUE of the preceding flag,
+   * rather than treated as the next flag.
+   *
+   * Bug fix (audit #1, follow-up to #2222): a negative numeric value such as
+   * `-1.0` starts with '-', so the old `!arg.startsWith('-')` test rejected it
+   * as a value and parsed it as a (bogus) short flag. For `route feedback
+   * -r -1.0` this silently dropped the value and coerced reward to `true` → 1.0,
+   * so NEGATIVE feedback REINFORCED the agent. Only `--reward=-1.0` worked.
+   *
+   * Anything not starting with '-' is a value (unchanged). Anything that starts
+   * with '-' is a value ONLY if it is a pure negative number (e.g. `-1`, `-1.0`,
+   * `-3.14`, `-1e3`). Real flags like `-r`, `--reward`, `-abc` are never numeric
+   * after the leading dash, so they are still correctly treated as flags.
+   */
+  private isFlagValue(arg: string): boolean {
+    if (!arg.startsWith('-')) return true;
+    // Negative number: '-' followed by a parseable numeric literal.
+    return /^-\d*\.?\d+(?:[eE][+-]?\d+)?$/.test(arg);
+  }
+
+  /** True for the literal tokens `true`/`false` (case-insensitive). Used so a
+   * boolean flag can take an explicit value in the space form, e.g.
+   * `--explore false` / `-e true`. */
+  private isBooleanLiteral(arg: string): boolean {
+    const a = arg.toLowerCase();
+    return a === 'true' || a === 'false';
   }
 
   private parseValue(value: string): string | number | boolean {

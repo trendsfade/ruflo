@@ -52,7 +52,10 @@ export function generateMCPConfig(options: InitOptions): object {
     npm_config_update_notifier: 'false',
   };
 
-  // Claude Flow MCP server (core) — uses ruflo wrapper for portable npm-resolved invocation
+  // Ruflo MCP server (core) — uses ruflo wrapper for portable npm-resolved invocation.
+  // #2206: key MUST be 'claude-flow' so all plugins resolve as mcp__claude-flow__*.
+  // The command args (ruflo@latest mcp start) are the correct wrapper invocation — only the
+  // registration KEY changes here.
   if (config.claudeFlow) {
     mcpServers['claude-flow'] = createMCPServerEntry(
       ['ruflo@latest', 'mcp', 'start'],
@@ -106,6 +109,7 @@ export function generateMCPCommands(options: InitOptions): string[] {
 
   if (isWindows()) {
     if (config.claudeFlow) {
+      // #2206: registration name must be 'claude-flow' to match mcp__claude-flow__* tool naming
       commands.push('claude mcp add claude-flow -- cmd /c npx -y ruflo@latest mcp start');
     }
     if (config.ruvSwarm) {
@@ -116,6 +120,7 @@ export function generateMCPCommands(options: InitOptions): string[] {
     }
   } else {
     if (config.claudeFlow) {
+      // #2206: registration name must be 'claude-flow' to match mcp__claude-flow__* tool naming
       commands.push("claude mcp add claude-flow -- npx -y ruflo@latest mcp start");
     }
     if (config.ruvSwarm) {

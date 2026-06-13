@@ -25,7 +25,36 @@
 /* eslint-disable @typescript-eslint/no-var-requires */
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
+const os = require('os');
+const { execSync, execFileSync } = require('child_process');
+
+// Read the installed plugin version once at startup. Probe the plugin's own
+// install location first (`~/.claude/plugins/marketplaces/ruflo/package.json`),
+// then npm-style installs, then the source-checkout location. The previous
+// code hardcoded `RuFlo V3.5` in the header — so users on alpha.27+ still
+// saw V3.5 in the statusline even though `ruflo doctor` reported the real
+// version (#1951).
+let RUFLO_VERSION = '3.6';
+try {
+  const home = os.homedir();
+  const cwd = process.cwd();
+  const pkgPaths = [
+    path.join(home, '.claude', 'plugins', 'marketplaces', 'ruflo', 'package.json'),
+    path.join(cwd, 'node_modules', '@claude-flow', 'cli', 'package.json'),
+    path.join(cwd, 'node_modules', 'ruflo', 'package.json'),
+    path.join(cwd, 'v3', '@claude-flow', 'cli', 'package.json'),
+  ];
+  for (const p of pkgPaths) {
+    if (!fs.existsSync(p)) continue;
+    try {
+      const pkg = JSON.parse(fs.readFileSync(p, 'utf-8'));
+      if (pkg && typeof pkg.version === 'string' && pkg.version.length > 0) {
+        RUFLO_VERSION = pkg.version;
+        break;
+      }
+    } catch { /* malformed package.json — try next */ }
+  }
+} catch { /* fall through to the hardcoded default */ }
 
 // Configuration
 const CONFIG = {
@@ -70,19 +99,17 @@ function getUserInfo() {
   let gitBranch = '';
   let modelName = 'Unknown';
 
+  // audit_1776853149979: previously used execSync with a shell string. Switched
+  // to execFileSync('git', argv) on both platforms so there is no shell
+  // interpretation. Cross-platform behavior is preserved by relying on git's
+  // own exit code instead of `|| echo` fallbacks: missing repo / no user.name
+  // throws, caught below, defaults retained.
   try {
-    const gitUserCmd = isWindows
-      ? 'git config user.name 2>NUL || echo user'
-      : 'git config user.name 2>/dev/null || echo "user"';
-    const gitBranchCmd = isWindows
-      ? 'git branch --show-current 2>NUL || echo.'
-      : 'git branch --show-current 2>/dev/null || echo ""';
-    name = execSync(gitUserCmd, { encoding: 'utf-8' }).trim();
-    gitBranch = execSync(gitBranchCmd, { encoding: 'utf-8' }).trim();
-    if (gitBranch === '.') gitBranch = ''; // Windows echo. outputs a dot
-  } catch (e) {
-    // Ignore errors
-  }
+    name = execFileSync('git', ['config', 'user.name'], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() || 'user';
+  } catch { /* keep default */ }
+  try {
+    gitBranch = execFileSync('git', ['branch', '--show-current'], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch { /* keep empty */ }
 
   // Auto-detect model from Claude Code's config
   try {
@@ -404,7 +431,7 @@ function generateStatusline() {
   const lines = [];
 
   // Header Line
-  let header = `${c.bold}${c.brightPurple}▊ RuFlo V3.5 ${c.reset}`;
+  let header = `${c.bold}${c.brightPurple}▊ RuFlo V${RUFLO_VERSION} ${c.reset}`;
   header += `${swarm.coordinationActive ? c.brightCyan : c.dim}● ${c.brightCyan}${user.name}${c.reset}`;
   if (user.gitBranch) {
     header += `  ${c.dim}│${c.reset}  ${c.brightBlue}⎇ ${user.gitBranch}${c.reset}`;
@@ -510,7 +537,7 @@ function generateSafeStatusline() {
   const lines = [];
 
   // Header Line
-  let header = `${c.bold}${c.brightPurple}▊ RuFlo V3.5 ${c.reset}`;
+  let header = `${c.bold}${c.brightPurple}▊ RuFlo V${RUFLO_VERSION} ${c.reset}`;
   header += `${swarm.coordinationActive ? c.brightCyan : c.dim}● ${c.brightCyan}${user.name}${c.reset}`;
   if (user.gitBranch) {
     header += `  ${c.dim}│${c.reset}  ${c.brightBlue}⎇ ${user.gitBranch}${c.reset}`;

@@ -32,13 +32,21 @@ export function createDualModeCommand(): Command {
 function createRunCommand(): Command {
   return new Command('run')
     .description('Run a collaborative dual-mode swarm')
+    .argument('[template]', 'Pre-built template name (feature, security, refactor) — positional alias for --template')
     .option('-t, --template <name>', 'Use a pre-built template (feature, security, refactor)')
+    .option(
+      '-w, --worker <spec>',
+      'Worker spec "<platform>:<role>:<prompt>" (platform = claude|codex). Repeatable. Workers chain sequentially unless --parallel-workers.',
+      (val: string, acc: string[]) => { acc.push(val); return acc; },
+      [] as string[],
+    )
+    .option('--parallel-workers', 'Run --worker specs in parallel instead of chaining them sequentially', false)
     .option('-c, --config <path>', 'Path to collaboration config JSON')
     .option('--task <description>', 'Task description for the swarm')
     .option('--max-concurrent <n>', 'Maximum concurrent workers', '4')
     .option('--timeout <ms>', 'Worker timeout in milliseconds', '300000')
     .option('--namespace <name>', 'Shared memory namespace', 'collaboration')
-    .action(async (options) => {
+    .action(async (templateArg: string | undefined, options) => {
       console.log(chalk.cyan('═══════════════════════════════════════════════════════════════'));
       console.log(chalk.cyan.bold('  DUAL-MODE COLLABORATIVE EXECUTION'));
       console.log(chalk.cyan('  Claude Code + Codex workers with shared memory'));
@@ -75,21 +83,30 @@ function createRunCommand(): Command {
       let workers: WorkerConfig[];
       let taskContext: string;
 
-      if (options.template) {
+      const workerSpecs: string[] = (options.worker as string[] | undefined) ?? [];
+      const templateName: string | undefined = options.template ?? templateArg;
+
+      if (workerSpecs.length > 0) {
+        workers = parseWorkerSpecs(workerSpecs, options.parallelWorkers === true);
+        taskContext = options.task || `Custom dual-mode swarm: ${workers.map(w => `${w.platform}:${w.role}`).join(' -> ')}`;
+      } else if (templateName) {
         const task = options.task || 'Complete the assigned task';
-        workers = getTemplateWorkers(options.template, task);
-        taskContext = `Template: ${options.template}, Task: ${task}`;
+        workers = getTemplateWorkers(templateName, task);
+        taskContext = `Template: ${templateName}, Task: ${task}`;
       } else if (options.config) {
         const configData = await import(options.config);
         workers = configData.workers;
         taskContext = configData.taskContext || options.task || 'Collaborative task';
       } else {
-        console.log(chalk.yellow('Please specify --template or --config'));
+        console.log(chalk.yellow('Please specify --template <name>, a [template] argument, --worker <spec> (repeatable), or --config <path>'));
         console.log();
-        console.log('Available templates:');
-        console.log('  feature  - Feature development (architect → coder → tester → reviewer)');
-        console.log('  security - Security audit (scanner → analyzer → fixer)');
-        console.log('  refactor - Code refactoring (analyzer → planner → refactorer → validator)');
+        console.log('Templates:');
+        console.log('  feature  - Feature development (architect -> coder -> tester -> reviewer)');
+        console.log('  security - Security audit (scanner -> analyzer -> fixer)');
+        console.log('  refactor - Code refactoring (analyzer -> planner -> refactorer -> validator)');
+        console.log();
+        console.log('Custom workers:');
+        console.log('  --worker "claude:architect:Design the API" --worker "codex:coder:Implement it"');
         return;
       }
 
@@ -170,7 +187,7 @@ function createStatusCommand(): Command {
       const { spawn } = await import('child_process');
 
       const proc = spawn('npx', [
-        'claude-flow@alpha', 'memory', 'list',
+        'ruflo@alpha', 'memory', 'list',
         '--namespace', options.namespace
       ], { stdio: 'inherit' });
 
@@ -178,6 +195,50 @@ function createStatusCommand(): Command {
         console.log();
       });
     });
+}
+
+/**
+ * Parse `--worker "<platform>:<role>:<prompt>"` specs into WorkerConfig[].
+ * Splits on the first two `:` so the prompt may itself contain colons.
+ * Workers chain sequentially (each depends on the previous) unless `parallel`.
+ */
+export function parseWorkerSpecs(specs: string[], parallel: boolean): WorkerConfig[] {
+  const usedIds = new Set<string>();
+  const workers: WorkerConfig[] = [];
+
+  specs.forEach((spec, index) => {
+    const firstColon = spec.indexOf(':');
+    const secondColon = firstColon >= 0 ? spec.indexOf(':', firstColon + 1) : -1;
+    if (firstColon < 0 || secondColon < 0) {
+      throw new Error(`Invalid --worker spec "${spec}". Expected "<platform>:<role>:<prompt>" (platform = claude|codex).`);
+    }
+    const platformRaw = spec.slice(0, firstColon).trim().toLowerCase();
+    const role = spec.slice(firstColon + 1, secondColon).trim() || `worker-${index + 1}`;
+    const prompt = spec.slice(secondColon + 1).trim();
+    if (!prompt) {
+      throw new Error(`Invalid --worker spec "${spec}". Missing prompt after "<platform>:<role>:".`);
+    }
+    if (platformRaw !== 'claude' && platformRaw !== 'codex') {
+      throw new Error(`Invalid platform "${platformRaw}" in --worker spec "${spec}". Use "claude" or "codex".`);
+    }
+    const platform: 'claude' | 'codex' = platformRaw;
+
+    // Derive a unique id from the role.
+    const base = role.replace(/\s+/g, '-');
+    let id = base;
+    let suffix = 2;
+    while (usedIds.has(id)) { id = `${base}-${suffix++}`; }
+    usedIds.add(id);
+
+    const worker: WorkerConfig = { id, platform, role, prompt };
+    const prev = workers[workers.length - 1];
+    if (!parallel && prev) {
+      worker.dependsOn = [prev.id];
+    }
+    workers.push(worker);
+  });
+
+  return workers;
 }
 
 /**
@@ -227,5 +288,5 @@ function printResults(result: CollaborationResult): void {
   }
 
   console.log();
-  console.log(chalk.gray('View shared memory: npx claude-flow@alpha memory list --namespace collaboration'));
+  console.log(chalk.gray('View shared memory: npx ruflo@alpha memory list --namespace collaboration'));
 }

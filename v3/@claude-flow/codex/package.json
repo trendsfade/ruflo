@@ -1,7 +1,7 @@
 {
   "name": "@claude-flow/codex",
   "version": "3.0.0-alpha.9",
-  "description": "Codex CLI integration for Claude Flow - OpenAI Codex platform adapter",
+  "description": "Codex CLI integration for Ruflo (claude-flow) - OpenAI Codex platform adapter",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -34,11 +34,15 @@
       "types": "./dist/dual-mode/index.d.ts",
       "import": "./dist/dual-mode/index.js",
       "require": "./dist/dual-mode/index.js"
+    },
+    "./loop": {
+      "types": "./dist/loop/index.d.ts",
+      "import": "./dist/loop/index.js",
+      "require": "./dist/loop/index.js"
     }
   },
   "files": [
-    "dist",
-    "templates"
+    "dist"
   ],
   "scripts": {
     "build": "tsc",
@@ -61,12 +65,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ruvnet/claude-flow.git",
+    "url": "https://github.com/ruvnet/ruflo.git",
     "directory": "v3/@claude-flow/codex"
   },
-  "homepage": "https://github.com/ruvnet/claude-flow#readme",
+  "homepage": "https://github.com/ruvnet/ruflo#readme",
   "bugs": {
-    "url": "https://github.com/ruvnet/claude-flow/issues"
+    "url": "https://github.com/ruvnet/ruflo/issues"
   },
   "engines": {
     "node": ">=18"
@@ -92,7 +96,7 @@
     "@types/fs-extra": "^11.0.4",
     "@types/node": "^20.0.0",
     "typescript": "^5.4.0",
-    "vitest": "^1.4.0",
+    "vitest": "^4.0.16",
     "eslint": "^8.57.0"
   }
 }

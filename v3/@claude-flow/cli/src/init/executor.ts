@@ -26,6 +26,7 @@ import {
   generateHookHandler,
   generateIntelligenceStub,
   generateAutoMemoryHook,
+  generateRufloHookCjs,
 } from './helpers-generator.js';
 import { generateClaudeMd } from './claudemd-generator.js';
 
@@ -81,6 +82,10 @@ const SKILLS_MAP: Record<string, string[]> = {
 
 /**
  * Commands to copy based on configuration
+ * ADR-128 Phase 4: every subdirectory under .claude/commands/ now has a
+ * corresponding key. The flow-nexus/ dir was deleted (belongs to the plugin).
+ * New substrate keys default true; opt-in keys (pair, training, stream-chain,
+ * truth, verify) default false per ADR-128 §Phase 3 opt-in rationale.
  */
 const COMMANDS_MAP: Record<string, string[]> = {
   core: ['claude-flow-help.md', 'claude-flow-swarm.md', 'claude-flow-memory.md'],
@@ -91,6 +96,19 @@ const COMMANDS_MAP: Record<string, string[]> = {
   monitoring: ['monitoring'],
   optimization: ['optimization'],
   sparc: ['sparc'],
+  // ADR-128 Phase 4 promotions (previously orphaned)
+  agents: ['agents'],
+  coordination: ['coordination'],
+  hiveMind: ['hive-mind'],
+  memory: ['memory'],
+  swarm: ['swarm'],
+  workflows: ['workflows'],
+  // Opt-in categories (non-universal; default false in CommandsConfig)
+  pair: ['pair'],
+  training: ['training'],
+  streamChain: ['stream-chain'],
+  truth: ['truth'],
+  verify: ['verify'],
 };
 
 /**
@@ -776,6 +794,87 @@ async function writeSettings(
 }
 
 /**
+ * #1779 — Walk parents of `targetDir` plus the user-global Claude Code
+ * config locations, looking for any `.mcp.json` (or `~/.claude.json`)
+ * that already declares a `ruflo`-keyed MCP server. We use this to skip
+ * writing our own `claude-flow`-keyed entry when the user has already
+ * registered the same binary under the new name — that's exactly the
+ * "same MCP server twice under two different prefixes" duplication the
+ * issue describes.
+ *
+ * Returns the path of the file that already declares `ruflo` (so we can
+ * surface it in the skipped-message), or null if none found.
+ */
+function detectExistingRufloMCP(targetDir: string): string | null {
+  const home = (process.env.HOME ?? process.env.USERPROFILE) ?? '';
+  const candidates = new Set<string>();
+  // User-global Claude Code config locations
+  if (home) {
+    candidates.add(path.join(home, '.claude.json'));
+    candidates.add(path.join(home, '.claude', 'mcp.json'));
+  }
+  // Walk parents of targetDir up to root, checking for .mcp.json at each
+  const targetResolved = path.resolve(targetDir);
+  let dir = targetResolved;
+  const targetAncestors = new Set<string>();
+  while (true) {
+    candidates.add(path.join(dir, '.mcp.json'));
+    targetAncestors.add(normalizeProjectKey(dir));
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  // Skip the targetDir itself — that's the one we're about to write
+  candidates.delete(path.join(targetResolved, '.mcp.json'));
+
+  for (const candidate of candidates) {
+    if (!fs.existsSync(candidate)) continue;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(candidate, 'utf-8'));
+      if (!parsed || typeof parsed !== 'object') continue;
+      // (a) Top-level mcpServers (legacy / global form).
+      // #2207: accept BOTH the old 'ruflo' key AND the new 'claude-flow' key so that
+      // a prior install with either key is correctly detected as already-initialized.
+      // This also avoids the reverse problem: after #2206 fixed the generator to write
+      // 'claude-flow', a second `ruflo init` must still recognise the existing install.
+      if (parsed.mcpServers && typeof parsed.mcpServers === 'object') {
+        const servers = parsed.mcpServers as Record<string, unknown>;
+        if ('claude-flow' in servers || 'ruflo' in servers) return candidate;
+      }
+      // (b) #1840: Claude Code project-scoped registrations under
+      //     parsed.projects[<projectPath>].mcpServers. Match by
+      //     normalized path against targetDir or any of its ancestors so
+      //     a `claude mcp add claude-flow` (or legacy `ruflo`) in this repo is
+      //     detected even when Claude stored the key with different casing/slash style.
+      // #2207: accept both keys here too.
+      if (parsed.projects && typeof parsed.projects === 'object') {
+        for (const [projectKey, projectVal] of Object.entries(parsed.projects)) {
+          if (!projectVal || typeof projectVal !== 'object') continue;
+          const projectMcp = (projectVal as { mcpServers?: unknown }).mcpServers;
+          if (!projectMcp || typeof projectMcp !== 'object') continue;
+          const mcp = projectMcp as Record<string, unknown>;
+          if (!('claude-flow' in mcp) && !('ruflo' in mcp)) continue;
+          if (targetAncestors.has(normalizeProjectKey(projectKey))) {
+            return `${candidate} (projects[${projectKey}])`;
+          }
+        }
+      }
+    } catch { /* malformed JSON — ignore */ }
+  }
+  return null;
+}
+
+/**
+ * Normalize a project path key for cross-platform comparison.
+ * Claude Code stores Windows paths like "C:/Users/.../Project" while
+ * Node's `path.resolve()` may emit "C:\Users\...\Project". Lowercase +
+ * forward-slash gives a stable comparison key on both platforms.
+ */
+function normalizeProjectKey(p: string): string {
+  return path.resolve(p).replace(/\\/g, '/').toLowerCase();
+}
+
+/**
  * Write .mcp.json
  */
 async function writeMCPConfig(
@@ -788,6 +887,20 @@ async function writeMCPConfig(
   if (fs.existsSync(mcpPath) && !options.force) {
     result.skipped.push('.mcp.json');
     return;
+  }
+
+  // #1779 — Skip writing if the user already has a `ruflo`-keyed MCP
+  // server registered elsewhere (parent .mcp.json, ~/.claude.json, etc).
+  // Writing our `claude-flow`-keyed entry on top of that produces the
+  // duplicate-registration the issue describes (~250 duplicate tools).
+  // Force-mode (`--force`) bypasses this guard for users who actually
+  // want both registrations.
+  if (!options.force) {
+    const existingRufloPath = detectExistingRufloMCP(targetDir);
+    if (existingRufloPath) {
+      result.skipped.push(`.mcp.json (existing 'ruflo' MCP registration found at ${existingRufloPath} — would create duplicate; pass --force to write anyway)`);
+      return;
+    }
   }
 
   const content = generateMCPJson(options);
@@ -871,6 +984,19 @@ async function copyCommands(
     if (commandsConfig.monitoring) commandsToCopy.push(...COMMANDS_MAP.monitoring);
     if (commandsConfig.optimization) commandsToCopy.push(...COMMANDS_MAP.optimization);
     if (commandsConfig.sparc) commandsToCopy.push(...COMMANDS_MAP.sparc);
+    // ADR-128 Phase 4 substrate promotions
+    if (commandsConfig.agents) commandsToCopy.push(...(COMMANDS_MAP.agents || []));
+    if (commandsConfig.coordination) commandsToCopy.push(...(COMMANDS_MAP.coordination || []));
+    if (commandsConfig.hiveMind) commandsToCopy.push(...(COMMANDS_MAP.hiveMind || []));
+    if (commandsConfig.memory) commandsToCopy.push(...(COMMANDS_MAP.memory || []));
+    if (commandsConfig.swarm) commandsToCopy.push(...(COMMANDS_MAP.swarm || []));
+    if (commandsConfig.workflows) commandsToCopy.push(...(COMMANDS_MAP.workflows || []));
+    // ADR-128 Phase 4 opt-in categories
+    if (commandsConfig.pair) commandsToCopy.push(...(COMMANDS_MAP.pair || []));
+    if (commandsConfig.training) commandsToCopy.push(...(COMMANDS_MAP.training || []));
+    if (commandsConfig.streamChain) commandsToCopy.push(...(COMMANDS_MAP.streamChain || []));
+    if (commandsConfig.truth) commandsToCopy.push(...(COMMANDS_MAP.truth || []));
+    if (commandsConfig.verify) commandsToCopy.push(...(COMMANDS_MAP.verify || []));
   }
 
   // Find source commands directory
@@ -1029,6 +1155,12 @@ async function writeHelpers(
   // Find source helpers directory (works for npm package and local dev)
   const sourceHelpersDir = findSourceHelpersDir(options.sourceBaseDir);
 
+  // On Windows: emit a notice before writing helpers — the settings.json
+  // hooks will use node-based commands instead of bash shims (#2132).
+  if (process.platform === 'win32') {
+    console.log('Detected Windows — adding cross-platform hook overrides to .claude/settings.json (#2132)');
+  }
+
   // Try to copy existing helpers from source first
   if (sourceHelpersDir && fs.existsSync(sourceHelpersDir)) {
     const helperFiles = fs.readdirSync(sourceHelpersDir);
@@ -1056,6 +1188,18 @@ async function writeHelpers(
       }
     }
 
+    // #2132: Always generate ruflo-hook.cjs regardless of source copy path.
+    // The source helpers dir may not contain this file (it lives in
+    // plugins/ruflo-core/scripts/, not .claude/helpers/), but it must
+    // always be present so Windows users can use the node-based shim.
+    const rufloHookDest = path.join(helpersDir, 'ruflo-hook.cjs');
+    if (!fs.existsSync(rufloHookDest) || options.force) {
+      fs.writeFileSync(rufloHookDest, generateRufloHookCjs(), 'utf-8');
+      result.created.files.push('.claude/helpers/ruflo-hook.cjs');
+    } else {
+      result.skipped.push('.claude/helpers/ruflo-hook.cjs');
+    }
+
     if (copiedCount > 0) {
       return; // Skip generating if we copied from source
     }
@@ -1071,6 +1215,10 @@ async function writeHelpers(
     'hook-handler.cjs': generateHookHandler(),
     'intelligence.cjs': generateIntelligenceStub(),
     'auto-memory-hook.mjs': generateAutoMemoryHook(),
+    // #2132: cross-platform Node.js port of ruflo-hook.sh — always deployed so
+    // Windows users have a working shim even if the plugin's hooks.json bash
+    // commands are overridden via settings.json.
+    'ruflo-hook.cjs': generateRufloHookCjs(),
   };
 
   for (const [name, content] of Object.entries(helpers)) {
@@ -1819,6 +1967,18 @@ async function writeClaudeMd(
   if (fs.existsSync(claudeMdPath) && !options.force) {
     result.skipped.push('CLAUDE.md');
   } else {
+    // #2208: if overwriting an existing CLAUDE.md (force mode), back it up first so
+    // users don't silently lose curated project context.
+    if (fs.existsSync(claudeMdPath)) {
+      const backupBase = `${claudeMdPath}.pre-ruflo`;
+      // Don't clobber an existing backup — append a timestamp if one already exists.
+      const backupPath = fs.existsSync(backupBase)
+        ? `${backupBase}.${Date.now()}`
+        : backupBase;
+      fs.copyFileSync(claudeMdPath, backupPath);
+      result.created.files.push(path.basename(backupPath));
+      console.warn(`[ruflo init] Existing CLAUDE.md backed up to ${path.basename(backupPath)} before overwrite`);
+    }
     // Determine template: explicit option > infer from components > 'standard'
     const inferredTemplate = (!options.components.commands && !options.components.agents) ? 'minimal' : undefined;
     const content = generateClaudeMd(options, inferredTemplate);
@@ -1827,9 +1987,11 @@ async function writeClaudeMd(
     result.created.files.push('CLAUDE.md');
   }
 
-  // Also write/append global ~/.claude/CLAUDE.md so ruflo tools are used automatically (#1497)
+  // Also write/append global ~/.claude/CLAUDE.md so ruflo tools are used automatically (#1497).
+  // Opt-out via --no-global / options.skipGlobalClaudeMd (#1744 — keeps global rules file pristine
+  // for users who don't want a per-machine pointer block).
   const homeDir = process.env.HOME || process.env.USERPROFILE || '';
-  if (homeDir) {
+  if (homeDir && !options.skipGlobalClaudeMd) {
     const globalClaudeDir = path.join(homeDir, '.claude');
     const globalClaudeMd = path.join(globalClaudeDir, 'CLAUDE.md');
     const rufloBlock = [
@@ -1858,6 +2020,8 @@ async function writeClaudeMd(
     } catch {
       // Non-critical — global CLAUDE.md is best-effort
     }
+  } else if (options.skipGlobalClaudeMd) {
+    result.skipped.push('~/.claude/CLAUDE.md (--no-global)');
   }
 }
 

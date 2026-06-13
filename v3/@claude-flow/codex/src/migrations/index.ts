@@ -776,9 +776,9 @@ export function convertSettingsToToml(settings: Record<string, unknown>): string
     }
   } else {
     // Add default claude-flow server
-    lines.push('[mcp_servers.claude-flow]');
+    lines.push('[mcp_servers.ruflo]');
     lines.push('command = "npx"');
-    lines.push('args = ["-y", "@claude-flow/cli@latest"]');
+    lines.push('args = ["-y", "ruflo@latest", "mcp", "start"]');
     lines.push('enabled = true');
     lines.push('');
   }
@@ -852,9 +852,9 @@ export function generateConfigTomlFromParsed(parsed: ParsedClaudeMd): string {
     }
   } else {
     // Default claude-flow server
-    lines.push('[mcp_servers.claude_flow]');
+    lines.push('[mcp_servers.ruflo]');
     lines.push('command = "npx"');
-    lines.push('args = ["-y", "@claude-flow/cli@latest"]');
+    lines.push('args = ["-y", "ruflo@latest", "mcp", "start"]');
     lines.push('enabled = true');
     lines.push('');
   }

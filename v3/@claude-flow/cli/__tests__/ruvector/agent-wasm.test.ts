@@ -130,7 +130,14 @@ import {
 
 // ── Tests ────────────────────────────────────────────────────
 
-describe('agent-wasm integration', () => {
+// Skip in CI — the WASM init crashes during module load even with the
+// vi.mock above, because the mock replaces *some* of the loading path but
+// the real @ruvector/rvagent-wasm import still happens. Local runs where
+// the WASM binary is built work fine; CI without postinstall doesn't.
+// See ruvllm-wasm.test.ts for the same pattern.
+const __SKIP_WASM_TESTS = process.env.CI === 'true';
+
+describe.skipIf(__SKIP_WASM_TESTS)('agent-wasm integration', () => {
   describe('detection and init', () => {
     it('detects module availability', async () => {
       expect(await isAgentWasmAvailable()).toBe(true);
@@ -154,7 +161,7 @@ describe('agent-wasm integration', () => {
       agentId = info.id;
       expect(info.id).toMatch(/^wasm-agent-/);
       expect(info.state).toBe('idle');
-      expect(info.model).toBe('anthropic:claude-sonnet-4-20250514');
+      expect(info.model).toBe('anthropic:claude-sonnet-4-6');
       expect(info.fileCount).toBe(0);
       expect(info.isStopped).toBe(false);
     });
@@ -325,6 +332,11 @@ describe('agent-wasm integration', () => {
     it('creates agent from template', async () => {
       const info = await createAgentFromTemplate('coder');
       expect(info.id).toMatch(/^wasm-agent-/);
+      // #1810 — gallery templates pass `model: undefined` and must
+      // inherit the current default. Pin the assertion here so a
+      // future regression of the default surfaces in the gallery path
+      // too, not just in the bare `createWasmAgent` path.
+      expect(info.model).toBe('anthropic:claude-sonnet-4-6');
       terminateWasmAgent(info.id);
     });
 

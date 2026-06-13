@@ -1,5 +1,6 @@
 import { FederationNode, type FederationNodeProps } from '../entities/federation-node.js';
 import { TrustLevel } from '../entities/trust-level.js';
+import type { WgManifestSection } from '../value-objects/wg-config.js';
 
 export type DiscoveryMechanism = 'static' | 'dns-sd' | 'ipfs-registry';
 
@@ -16,6 +17,13 @@ export interface FederationManifest {
   readonly version: string;
   readonly signature: string;
   readonly timestamp: string;
+  /**
+   * ADR-111 — optional WG mesh identity. Present only when the publishing
+   * node has opted into the in-tree WG layer (`config.wgMesh: true`).
+   * The Ed25519 manifest signature covers this block too — peers verifying
+   * the manifest also verify the WG-key binding.
+   */
+  readonly wg?: WgManifestSection;
 }
 
 export interface DiscoveryServiceDeps {

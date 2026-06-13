@@ -11,11 +11,16 @@
 
 export type JsonRpcVersion = '2.0';
 
-export interface MCPProtocolVersion {
-  major: number;
-  minor: number;
-  patch: number;
-}
+/**
+ * MCP protocol version. Per the [MCP spec](https://spec.modelcontextprotocol.io/specification/basic/lifecycle/#initialization)
+ * this must be a `YYYY-MM-DD` date string (e.g. `'2024-11-05'`, `'2025-06-18'`).
+ *
+ * Earlier versions of this type used `{major,minor,patch}`, which Claude
+ * Code's Zod validator rejects with `Invalid input: expected string,
+ * received object` (#1874). The string form is canonical and cross-client
+ * compatible.
+ */
+export type MCPProtocolVersion = string;
 
 export type RequestId = string | number | null;
 

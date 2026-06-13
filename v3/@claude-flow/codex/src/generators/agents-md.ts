@@ -85,7 +85,7 @@ ${testCommand}
 
 ## Links
 
-- Documentation: https://github.com/ruvnet/claude-flow
+- Documentation: https://github.com/ruvnet/ruflo
 `;
 }
 
@@ -232,7 +232,7 @@ Use MCP tools for coordination, then keep coding:
 
 [optional body]
 
-Co-Authored-By: claude-flow <ruv@ruv.net>
+Co-Authored-By: ruflo-bot <ruflo-bot@users.noreply.github.com>
 \`\`\`
 
 Types: \`feat\`, \`fix\`, \`docs\`, \`style\`, \`refactor\`, \`perf\`, \`test\`, \`chore\`
@@ -279,8 +279,8 @@ npx @claude-flow/cli hooks pre-task --description "task summary"
 
 ## Links
 
-- Documentation: https://github.com/ruvnet/claude-flow
-- Issues: https://github.com/ruvnet/claude-flow/issues
+- Documentation: https://github.com/ruvnet/ruflo
+- Issues: https://github.com/ruvnet/ruflo/issues
 `;
 }
 
@@ -336,10 +336,10 @@ Claude Flow exposes tools via Model Context Protocol:
 
 \`\`\`bash
 # Start MCP server
-npx @claude-flow/cli mcp start
+npx ruflo mcp start
 
 # List available tools
-npx @claude-flow/cli mcp tools
+npx ruflo mcp tools
 \`\`\`
 
 ### Available Tools

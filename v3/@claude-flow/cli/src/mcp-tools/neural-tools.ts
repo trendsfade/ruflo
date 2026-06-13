@@ -17,15 +17,51 @@ import { validateIdentifier, validateText } from './validate-input.js';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-// Try to import real embeddings — prefer agentic-flow v3 ReasoningBank, then @claude-flow/embeddings
+// Try to import real embeddings.
+// Tier 0 (NEW, ADR-089): ruvector@0.2.27 bundled ONNX (no sharp dep, fixes ADR-086's
+//   silent-fallback bug at source; closes the chain described in ruvnet/ruvector#523).
+// Tier 1: agentic-flow v3 ReasoningBank (was Tier 1 — broken on darwin-arm64 without sharp)
+// Tier 2-3: @claude-flow/embeddings
 let realEmbeddings: { embed: (text: string) => Promise<number[]> } | null = null;
 let embeddingServiceName: string = 'none';
 try {
-  // Tier 1: agentic-flow v3 ReasoningBank (fastest — WASM-accelerated)
-  const rb = await import('agentic-flow/reasoningbank').catch(() => null);
-  if (rb?.computeEmbedding) {
-    realEmbeddings = { embed: (text: string) => rb.computeEmbedding(text) };
-    embeddingServiceName = 'agentic-flow/reasoningbank';
+  // Tier 0: ruvector@0.2.27 — bundled all-MiniLM-L6-v2 + parallel worker pool.
+  // Probe with isOnnxAvailable() and verify an actual embed succeeds (avoids
+  // the type-load-success-but-runtime-fails trap from ADR-086).
+  // NOTE: ruvector's embed() returns `{embedding, dimension, timeMs}` — we
+  // unwrap to plain number[] for the shared interface.
+  const rv = await import('ruvector').catch(() => null) as any;
+  if (rv?.embed && typeof rv.embed === 'function' && rv.isOnnxAvailable?.()) {
+    try {
+      if (typeof rv.initOnnxEmbedder === 'function') await rv.initOnnxEmbedder();
+      const probe = await rv.embed('probe');
+      // Handle both shapes: ruvector wraps as {embedding, dimension, timeMs};
+      // some versions returned raw Float32Array.
+      const probeVec = probe?.embedding ?? probe;
+      if (probeVec && (Array.isArray(probeVec) || (probeVec as ArrayLike<number>).length > 0)) {
+        realEmbeddings = {
+          embed: async (text: string) => {
+            const r = await rv.embed(text);
+            const v = r?.embedding ?? r;
+            return Array.isArray(v) ? v : Array.from(v as ArrayLike<number>);
+          },
+        };
+        embeddingServiceName = 'ruvector@0.2.27 (bundled all-MiniLM-L6-v2)';
+      }
+    } catch {
+      // ruvector embed failed at runtime; fall through to next tier
+    }
+  }
+
+  // Tier 1: agentic-flow v3 ReasoningBank (kept for backward-compat; may
+  // silently fall back on darwin-arm64 without sharp — that's the bug
+  // Tier 0 was added to bypass).
+  if (!realEmbeddings) {
+    const rb = await import('agentic-flow/reasoningbank').catch(() => null);
+    if (rb?.computeEmbedding) {
+      realEmbeddings = { embed: (text: string) => rb.computeEmbedding(text) };
+      embeddingServiceName = 'agentic-flow/reasoningbank';
+    }
   }
 
   // Tier 2: @claude-flow/embeddings with agentic-flow provider
@@ -66,24 +102,11 @@ try {
     }
   }
 
-  // Tier 4: mock fallback (last resort — embeddings are not semantic)
-  if (!realEmbeddings) {
-    const embeddingsModule = await import('@claude-flow/embeddings').catch(() => null);
-    if (embeddingsModule?.createEmbeddingService) {
-      try {
-        const service = embeddingsModule.createEmbeddingService({ provider: 'mock' });
-        realEmbeddings = {
-          embed: async (text: string) => {
-            const result = await service.embed(text);
-            return Array.from(result.embedding);
-          },
-        };
-        embeddingServiceName = 'mock-fallback';
-      } catch {
-        // No embedding service available at all
-      }
-    }
-  }
+  // No Tier 4 mock fallback. If all real-embedder tiers fail to import or
+  // probe, leave realEmbeddings null and let downstream code use the
+  // explicit hash-fallback path with a clear _embeddingNote in stats.
+  // Silently substituting mock embeddings would hide a missing production
+  // dependency from callers — that's the bug ADR-086 was about.
 } catch {
   // No embedding provider available, will use fallback
 }
@@ -110,6 +133,10 @@ interface Pattern {
   name: string;
   type: string;
   embedding: number[];
+  /** Source text the embedding was built from. Cap 4096 chars. Used for
+   *  BM25 in hybrid retrieval (ADR-078). Optional for backwards compat —
+   *  pre-3.10.18 patterns fall back to `name` for BM25 tokenisation. */
+  content?: string;
   metadata: Record<string, unknown>;
   createdAt: string;
   usageCount: number;
@@ -151,6 +178,72 @@ function loadNeuralStore(): NeuralStore {
 function saveNeuralStore(store: NeuralStore): void {
   ensureNeuralDir();
   writeFileSync(getNeuralPath(), JSON.stringify(store, null, 2), 'utf-8');
+}
+
+/**
+ * Public helper: read-only stats about the neural store, for the unified
+ * learning-stats aggregator. Returns total pattern count + per-type breakdown
+ * without exposing the embeddings.
+ */
+export function getNeuralStoreStats(): {
+  patternCount: number;
+  byType: Record<string, number>;
+  modelCount: number;
+  source: string;
+} {
+  const store = loadNeuralStore();
+  const patterns = Object.values(store.patterns ?? {});
+  const byType: Record<string, number> = {};
+  for (const p of patterns) {
+    const t = (p as { type?: string }).type || 'unknown';
+    byType[t] = (byType[t] ?? 0) + 1;
+  }
+  return {
+    patternCount: patterns.length,
+    byType,
+    modelCount: Object.values(store.models ?? {}).length,
+    source: '.claude-flow/neural/patterns.json (loadNeuralStore)',
+  };
+}
+
+/**
+ * Public helper: store an array of patterns into the neural store so they
+ * surface via `neural_patterns list`. Used by hooks_pretrain so its extracted
+ * patterns are actually queryable, not just bundled in the `pretrain` namespace.
+ * #2245.
+ *
+ * Returns the number of patterns written.
+ */
+export async function storeNeuralPatterns(items: Array<{
+  name: string;
+  type: string;
+  content?: string;
+  metadata?: Record<string, unknown>;
+}>): Promise<{ stored: number; total: number }> {
+  if (!items || items.length === 0) return { stored: 0, total: 0 };
+  // realEmbeddings is initialised by the top-level IIFE in this module;
+  // generateEmbedding() falls back to a hash-based embedding if it isn't.
+  const store = loadNeuralStore();
+  let stored = 0;
+  for (const item of items) {
+    if (!item.name || !item.type) continue;
+    const sourceText = item.content ?? item.name;
+    const embedding = await generateEmbedding(sourceText);
+    const id = `pattern-${Date.now()}-${stored.toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    store.patterns[id] = {
+      id,
+      name: String(item.name).slice(0, 200),
+      type: String(item.type).slice(0, 64),
+      embedding,
+      content: typeof sourceText === 'string' ? sourceText.slice(0, 4096) : undefined,
+      metadata: item.metadata ?? {},
+      createdAt: new Date().toISOString(),
+      usageCount: 0,
+    };
+    stored++;
+  }
+  saveNeuralStore(store);
+  return { stored, total: items.length };
 }
 
 // Generate embedding - uses real ML embeddings if available, falls back to deterministic hash
@@ -206,7 +299,7 @@ function cosineSimilarity(a: number[], b: number[]): number {
 export const neuralTools: MCPTool[] = [
   {
     name: 'neural_train',
-    description: 'Train a neural model',
+    description: 'Train a neural model Use when nothing native trains on your workflow — Claude Code has no learning loop. Use to train SONA/MoE/EWC patterns from successful task outcomes; query via neural_predict before spawning agents. Off-path for one-shot work.',
     category: 'neural',
     inputSchema: {
       type: 'object',
@@ -260,10 +353,34 @@ export const neuralTools: MCPTool[] = [
 
           const embedding = await generateEmbedding(text, 384);
           const patternId = `${modelId}-train-${i}`;
+          // ADR-093 F11: extract a meaningful label instead of dumping raw
+          // training JSON as the pattern name. Audit reported neural_predict
+          // returned `label: <raw training data JSON>` because the previous
+          // fallback was `text.slice(0, 100)` where text was `JSON.stringify(entry)`.
+          let label: string;
+          if (typeof entry === 'string') {
+            label = entry.slice(0, 80);
+          } else if (entry && typeof entry === 'object') {
+            const e = entry as Record<string, unknown>;
+            // Prefer common semantic fields over a JSON dump
+            const labelField = e.label ?? e.category ?? e.class ?? e.tag ?? e.intent ?? e.name ?? e.title;
+            if (typeof labelField === 'string' && labelField.length > 0) {
+              label = labelField.slice(0, 80);
+            } else {
+              const summaryField = e.text ?? e.input ?? e.task ?? e.description ?? e.content;
+              if (typeof summaryField === 'string' && summaryField.length > 0) {
+                label = `${summaryField.slice(0, 60)}${summaryField.length > 60 ? '…' : ''}`;
+              } else {
+                // Last resort: reduce to a stable short hash-like id
+                label = `${modelType}:entry-${i}`;
+              }
+            }
+          } else {
+            label = `${modelType}:entry-${i}`;
+          }
           store.patterns[patternId] = {
             id: patternId,
-            name: typeof entry === 'object' && entry !== null && 'label' in entry
-              ? String((entry as Record<string, unknown>).label) : text.slice(0, 100),
+            name: label,
             type: modelType,
             embedding,
             metadata: { modelId, epoch: epochs, index: i, raw: entry },
@@ -299,7 +416,7 @@ export const neuralTools: MCPTool[] = [
   },
   {
     name: 'neural_predict',
-    description: 'Make predictions using a neural model',
+    description: 'Make predictions using a neural model Use when nothing native trains on your workflow — Claude Code has no learning loop. Use to train SONA/MoE/EWC patterns from successful task outcomes; query via neural_predict before spawning agents. Off-path for one-shot work.',
     category: 'neural',
     inputSchema: {
       type: 'object',
@@ -331,24 +448,48 @@ export const neuralTools: MCPTool[] = [
       const embedding = await generateEmbedding(inputText, 384);
       const latency = Math.round(performance.now() - startTime);
 
-      // Search stored patterns via real cosine similarity
+      // ADR-093 F11: real classifier head over stored patterns. Previously
+      // confidence was the raw cosine similarity (often clamped to 0 when
+      // stored embeddings were stale or zero-vectored). Now we run k-NN
+      // with cosine distance and apply a temperature-controlled softmax
+      // over the top-K so confidence is a proper distribution that sums
+      // to 1, and we surface enough metadata to trust the result.
       const storedPatterns = Object.values(store.patterns);
-      let predictions;
+      let predictions: Array<{ label: string; confidence: number; patternId: string; cosineSimilarity: number }>;
 
       if (storedPatterns.length > 0) {
-        // Real nearest-neighbor prediction using stored pattern embeddings
-        predictions = storedPatterns
-          .map(p => ({
-            label: p.name || p.type || p.id,
-            confidence: Math.max(0, cosineSimilarity(embedding, p.embedding)),
-            patternId: p.id,
-          }))
-          .sort((a, b) => b.confidence - a.confidence)
+        // Step 1: k-NN with cosine
+        const scored = storedPatterns
+          .map(p => {
+            const sim = cosineSimilarity(embedding, p.embedding);
+            return {
+              patternId: p.id,
+              label: p.name || p.type || p.id,
+              cosineSimilarity: sim,
+            };
+          })
+          .sort((a, b) => b.cosineSimilarity - a.cosineSimilarity)
           .slice(0, topK);
+
+        // Step 2: temperature-softmax over the top-K so confidence sums to 1.
+        // Temperature 0.1 sharpens differences between similar candidates.
+        const tau = 0.1;
+        const exps = scored.map(s => Math.exp(s.cosineSimilarity / tau));
+        const z = exps.reduce((a, b) => a + b, 0) || 1;
+        predictions = scored.map((s, i) => ({
+          label: s.label,
+          patternId: s.patternId,
+          cosineSimilarity: Number(s.cosineSimilarity.toFixed(4)),
+          confidence: Number((exps[i] / z).toFixed(4)),
+        }));
       } else {
-        // No patterns stored — no predictions possible
+        // No patterns stored — no predictions possible. Be honest about it
+        // instead of returning empty silently.
         predictions = [];
       }
+
+      const topConfidence = predictions[0]?.confidence ?? 0;
+      const topSimilarity = predictions[0]?.cosineSimilarity ?? 0;
 
       return {
         success: true,
@@ -356,18 +497,27 @@ export const neuralTools: MCPTool[] = [
         _embeddingSource: embeddingServiceName,
         embeddingProvider: embeddingServiceName,
         _hasStoredPatterns: storedPatterns.length > 0,
+        _classifierHead: storedPatterns.length > 0 ? 'knn-cosine+softmax(tau=0.1)' : 'none',
         modelId: model?.id || 'default',
         input: inputText,
         predictions,
+        // Surface cosineSimilarity separately so callers know whether the
+        // softmax confidence reflects true match strength.
+        topPrediction: predictions[0]?.label ?? null,
+        topConfidence,
+        topSimilarity,
         embedding: embedding.slice(0, 8), // Preview of embedding
         embeddingDims: embedding.length,
         latency,
+        ...(storedPatterns.length === 0 ? {
+          _note: 'No patterns stored. Train with neural_train(modelType, trainingData) before predicting.',
+        } : {}),
       };
     },
   },
   {
     name: 'neural_patterns',
-    description: 'Get or manage neural patterns',
+    description: 'Get or manage neural patterns Use when nothing native trains on your workflow — Claude Code has no learning loop. Use to train SONA/MoE/EWC patterns from successful task outcomes; query via neural_predict before spawning agents. Off-path for one-shot work.',
     category: 'neural',
     inputSchema: {
       type: 'object',
@@ -376,7 +526,18 @@ export const neuralTools: MCPTool[] = [
         patternId: { type: 'string', description: 'Pattern ID' },
         name: { type: 'string', description: 'Pattern name' },
         type: { type: 'string', description: 'Pattern type' },
+        content: { type: 'string', description: 'Pattern source text (used for BM25 in hybrid search; falls back to name)' },
         query: { type: 'string', description: 'Search query' },
+        limit: { type: 'number', description: 'Top-K results to return (default 10, max 100)' },
+        mode: { type: 'string', enum: ['hybrid', 'cosine'], description: 'Search mode — hybrid (cosine+BM25+MMR, default) or cosine (pre-3.10.18 behaviour, for A/B)' },
+        alpha: { type: 'number', description: 'Hybrid: cosine weight in [0,1]; (1-α) is BM25 weight (default 0.5, tuned ADR-082)' },
+        mmrLambda: { type: 'number', description: 'Hybrid: MMR balance — 1.0 = pure relevance, 0.0 = pure diversity (default 0.7, tuned ADR-082)' },
+        subjectWeight: { type: 'number', description: 'Hybrid: multi-field BM25 weight for subject/name (default 2.0 non-rerank, 3.0 with rerank — tuned ADR-082/083)' },
+        bodyWeight: { type: 'number', description: 'Hybrid: multi-field BM25 weight for body/content (default 1.0)' },
+        typePenaltyFactor: { type: 'number', description: 'Hybrid: meta-commit score multiplier — release/merge/bump commits × this factor (default 1.0 = disabled; set 0.5 for aggressive suppression)' },
+        rerank: { type: 'boolean', description: 'Hybrid: opt-in cross-encoder rerank pass over the top-K (ADR-080). Adds ~20-40 ms per (query, doc) pair; first call downloads ~30MB model. Gracefully degrades to hybrid+MMR order when unavailable.' },
+        hybridWeight: { type: 'number', description: 'Rerank: hybrid score weight in final combination (default 0.7, tuned ADR-083)' },
+        ceWeight: { type: 'number', description: 'Rerank: cross-encoder score weight in final combination (default 0.3, tuned ADR-083)' },
         data: { type: 'object', description: 'Pattern data' },
       },
     },
@@ -417,15 +578,17 @@ export const neuralTools: MCPTool[] = [
       if (action === 'store') {
         const patternId = `pattern-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         const patternName = (input.name as string) || 'Unnamed pattern';
+        const patternContent = (input.content as string) ?? patternName;
 
-        // Generate embedding from pattern name/content
-        const embedding = await generateEmbedding(patternName, 384);
+        // Generate embedding from pattern content (falls back to name).
+        const embedding = await generateEmbedding(patternContent, 384);
 
         const pattern: Pattern = {
           id: patternId,
           name: patternName,
           type: (input.type as string) || 'general',
           embedding,
+          content: typeof patternContent === 'string' ? patternContent.slice(0, 4096) : undefined,
           metadata: (input.data as Record<string, unknown>) || {},
           createdAt: new Date().toISOString(),
           usageCount: 0,
@@ -449,32 +612,164 @@ export const neuralTools: MCPTool[] = [
 
       if (action === 'search') {
         const query = input.query as string;
+        const k = Math.min(Math.max(Number(input.limit ?? input.topK ?? 10), 1), 100);
+        // ADR-078 hybrid retrieval controls. Cosine-only mode preserves the
+        // pre-3.10.18 behaviour for A/B tests via {mode:'cosine'}; default is
+        // hybrid (cosine + BM25 + MMR).
+        const mode = String(input.mode ?? 'hybrid');
+        const useRerank = input.rerank === true || String(input.rerank) === 'true';
+        // ADR-083 joint grid: rerank path benefits from DIFFERENT hybrid
+        // sub-params than non-rerank (the cross-encoder adds semantic depth,
+        // so the hybrid stage can be more keyword-focused). nDCG@3 0.900 →
+        // 0.963 on rerank just by switching sw 2.0 → 3.0 in the hybrid stage.
+        const alpha = Number(input.alpha ?? 0.5);
+        const mmrLambda = Number(input.mmrLambda ?? 0.7);
 
-        // Generate query embedding for real similarity search
+        const { tokenize, buildCorpusStats, hybridScores, mmrRerank, multiFieldBM25, typePenalty } =
+          await import('../memory/hybrid-retrieval.js');
+
         const queryEmbedding = await generateEmbedding(query, 384);
+        const patterns = Object.values(store.patterns);
 
-        // Calculate REAL cosine similarity against stored patterns
-        const results = Object.values(store.patterns)
-          .map(p => ({
-            ...p,
-            similarity: cosineSimilarity(queryEmbedding, p.embedding),
-          }))
-          .sort((a, b) => b.similarity - a.similarity)
-          .slice(0, 10);
+        // Compute cosine for every pattern (this is what the old path did).
+        const cosineArr = patterns.map((p) => cosineSimilarity(queryEmbedding, p.embedding));
+
+        if (mode === 'cosine') {
+          const ranked = patterns
+            .map((p, i) => ({ ...p, similarity: cosineArr[i] }))
+            .sort((a, b) => b.similarity - a.similarity)
+            .slice(0, k);
+          return {
+            _realSimilarity: true,
+            _realEmbedding: !!realEmbeddings,
+            _embeddingSource: embeddingServiceName,
+            embeddingProvider: embeddingServiceName,
+            mode: 'cosine',
+            query,
+            results: ranked.map((r) => ({ id: r.id, name: r.name, type: r.type, similarity: r.similarity })),
+            total: ranked.length,
+          };
+        }
+
+        // Hybrid path — multi-field BM25 (subject 3×, body 1×) + type penalty
+        // for meta-commits (release bumps / merges) per ADR-079. Falls back
+        // to single-field BM25 when no content is stored.
+        const subjectDocs = patterns.map((p) => tokenize(p.name ?? ''));
+        const bodyDocs = patterns.map((p) => {
+          // Body is content minus the subject — if content starts with name,
+          // strip it; otherwise use full content (with name removed if duplicated).
+          const c = p.content ?? '';
+          const n = p.name ?? '';
+          return tokenize(c.startsWith(n) ? c.slice(n.length) : c);
+        });
+        const subjectStats = buildCorpusStats(subjectDocs);
+        const bodyStats = buildCorpusStats(bodyDocs);
+        const queryTokens = tokenize(query);
+        // ADR-082: subjectWeight 3.0 → 2.0 from grid (sw=2 dominates at hybrid-only).
+        // ADR-083 joint grid: when rerank is on, the cross-encoder handles
+        // semantic understanding, so the hybrid stage can be MORE
+        // subject-focused (sw=3) — recovers nDCG@3 0.963.
+        const subjectWeight = Number(input.subjectWeight ?? (useRerank ? 3.0 : 2.0));
+        const bodyWeight = Number(input.bodyWeight ?? 1.0);
+        const bm25Arr = patterns.map((_, i) =>
+          multiFieldBM25(queryTokens, subjectDocs[i], bodyDocs[i], subjectStats, bodyStats, subjectWeight, bodyWeight),
+        );
+        const baseHybrid = hybridScores(cosineArr, bm25Arr, alpha);
+        // Type penalty — opt-in (default 1.0 = disabled). Ablation in ADR-079
+        // showed multi-field BM25 alone gives best top-1 (8/10 vs 7/10 with
+        // penalty enabled) because some relevant work commits also match the
+        // Merge/release regex. Callers wanting aggressive meta-commit
+        // suppression can set {typePenaltyFactor: 0.5}.
+        const typeFactor = Number(input.typePenaltyFactor ?? 1.0);
+        const hybridArr = typeFactor === 1.0
+          ? baseHybrid
+          : baseHybrid.map((s, i) => s * typePenalty(patterns[i].name, typeFactor));
+
+        // Candidate pool sizing: k*3 for MMR, k*6 for cross-encoder (it needs
+        // more options to find the truly-best). ADR-080 ablation: rerank over
+        // a narrow post-MMR slice degrades top-1; reranking a wider hybrid
+        // top-K*6 pool restores and exceeds the no-rerank baseline.
+        // useRerank declared at top of search block for conditional defaults.
+        const poolSize = useRerank ? k * 6 : k * 3;
+        const prelim = patterns
+          .map((p, i) => ({ p, hybrid: hybridArr[i], cosine: cosineArr[i], bm25: bm25Arr[i] }))
+          .sort((a, b) => b.hybrid - a.hybrid)
+          .slice(0, Math.min(poolSize, patterns.length));
+
+        const candidates = prelim.map(({ p, hybrid, cosine, bm25 }) => ({
+          id: p.id, name: p.name, type: p.type,
+          embedding: p.embedding,
+          content: p.content,
+          relevance: hybrid,
+          _cosine: cosine,
+          _bm25: bm25,
+        }));
+
+        let picked: Array<typeof candidates[number] & { mmrScore?: number; _crossEncoderScore?: number }>;
+
+        if (useRerank) {
+          // ADR-080: cross-encoder reranks the wider candidate pool, then
+          // final score = hybridWeight * hybrid + ceWeight * crossEncoder
+          // on normalised scales. Ablation showed cross-encoder alone hits
+          // 100% top-3 but loses top-1 (calibration on short commit subjects
+          // is noisy); linear combination preserves hybrid's top-1 strength
+          // while gaining the cross-encoder's recall.
+          try {
+            const { crossEncoderRerank } = await import('../memory/cross-encoder-rerank.js');
+            const { normalise } = await import('../memory/hybrid-retrieval.js');
+            const docs = candidates.map((c) => c.content || c.name);
+            const reranked = await crossEncoderRerank(query, docs);
+            const ceScores = new Array(candidates.length).fill(0);
+            for (const { index, score } of reranked) ceScores[index] = score;
+
+            const hybridNorm = normalise(candidates.map((c) => c.relevance));
+            const ceNorm = normalise(ceScores);
+            // ADR-083 joint grid: hw=0.7 cw=0.3 (with α=0.5 sw=3 from above) is
+            // the joint optimum at nDCG@3=0.963 (vs 0.900 at 0.5/0.5). The
+            // hybrid signal carries most of the relevance; the cross-encoder
+            // contributes a 30% smoothing/disambiguation kick.
+            const hybridWeight = Number(input.hybridWeight ?? 0.7);
+            const ceWeight = Number(input.ceWeight ?? 0.3);
+            const combined = candidates.map((c, i) => ({
+              ...c,
+              _crossEncoderScore: ceScores[i],
+              _combinedScore: hybridWeight * hybridNorm[i] + ceWeight * ceNorm[i],
+            }));
+            picked = combined
+              .sort((a, b) => b._combinedScore - a._combinedScore)
+              .slice(0, k);
+          } catch {
+            picked = candidates.slice(0, k);
+          }
+        } else {
+          // Default path: MMR diversity over top-K*3 hybrid candidates.
+          picked = mmrRerank(candidates, k, mmrLambda);
+        }
 
         return {
           _realSimilarity: true,
           _realEmbedding: !!realEmbeddings,
           _embeddingSource: embeddingServiceName,
           embeddingProvider: embeddingServiceName,
+          mode: 'hybrid',
+          alpha,
+          mmrLambda,
+          rerank: useRerank,
           query,
-          results: results.map(r => ({
+          results: picked.map((r) => ({
             id: r.id,
             name: r.name,
             type: r.type,
-            similarity: r.similarity,
+            similarity: r.relevance,   // exposed as `similarity` for back-compat
+            hybridScore: r.relevance,
+            cosineScore: r._cosine,
+            bm25Score: r._bm25,
+            mmrScore: r.mmrScore,
+            ...((r as { _crossEncoderScore?: number })._crossEncoderScore !== undefined
+              ? { crossEncoderScore: (r as { _crossEncoderScore?: number })._crossEncoderScore }
+              : {}),
           })),
-          total: results.length,
+          total: picked.length,
         };
       }
 
@@ -493,7 +788,7 @@ export const neuralTools: MCPTool[] = [
   },
   {
     name: 'neural_compress',
-    description: 'Compress neural model or embeddings',
+    description: 'Compress neural model or embeddings Use when nothing native trains on your workflow — Claude Code has no learning loop. Use to train SONA/MoE/EWC patterns from successful task outcomes; query via neural_predict before spawning agents. Off-path for one-shot work.',
     category: 'neural',
     inputSchema: {
       type: 'object',
@@ -605,7 +900,7 @@ export const neuralTools: MCPTool[] = [
   },
   {
     name: 'neural_status',
-    description: 'Get neural system status',
+    description: 'Get neural system status Use when nothing native trains on your workflow — Claude Code has no learning loop. Use to train SONA/MoE/EWC patterns from successful task outcomes; query via neural_predict before spawning agents. Off-path for one-shot work.',
     category: 'neural',
     inputSchema: {
       type: 'object',
@@ -652,7 +947,19 @@ export const neuralTools: MCPTool[] = [
         features: {
           hnsw: true,
           quantization: true,
-          flashAttention: false,
+          // #1770: probe the real loader instead of returning a literal false.
+          // Was hardcoded false, which contradicted hooks_intelligence_stats's
+          // simultaneous claim of `implementation: real-flash-attention`.
+          // The two surfaces now agree on a single source of truth.
+          flashAttention: await (async () => {
+            try {
+              // #1773 item 4 — flash-attention now lives in @claude-flow/neural
+              const { getFlashAttention } = await import('@claude-flow/neural');
+              return getFlashAttention() !== null;
+            } catch {
+              return false;
+            }
+          })(),
           reasoningBank: true,
         },
       };
@@ -660,7 +967,7 @@ export const neuralTools: MCPTool[] = [
   },
   {
     name: 'neural_optimize',
-    description: 'Optimize neural model performance',
+    description: 'Optimize neural model performance Use when nothing native trains on your workflow — Claude Code has no learning loop. Use to train SONA/MoE/EWC patterns from successful task outcomes; query via neural_predict before spawning agents. Off-path for one-shot work.',
     category: 'neural',
     inputSchema: {
       type: 'object',

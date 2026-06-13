@@ -261,7 +261,7 @@ const BACKEND_DEFS = [
   { name: "agentic-flow",   command: "npx", args: ["-y", "agentic-flow@alpha", "mcp", "start"], groups: ["agentic-flow"] },
   { name: "claude",         command: "claude", args: ["mcp", "serve"],                  groups: ["claude-code"] },
   { name: "gemini-mcp",     command: "npx", args: ["-y", "gemini-mcp-server"],          groups: ["gemini"] },
-  { name: "codex",          command: "npx", args: ["-y", "@openai/codex", "mcp", "serve"], groups: ["codex"] },
+  { name: "codex",          command: "npx", args: ["-y", "@openai/codex", "mcp-server"], groups: ["codex"] },
 ];
 
 const mcpBackends = new Map();
@@ -729,10 +729,34 @@ async function geminiGroundedSearch(query, mode = "search") {
 }
 
 // =============================================================================
+// SSRF GUARD — Reject requests to private/loopback ranges (CWE-918)
+// =============================================================================
+
+const PRIVATE_IP_RE = /^(?:10\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.|127\.|0\.|::1|fc|fd)/i;
+
+function assertSafeUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error(`SSRF guard: invalid URL — ${rawUrl}`);
+  }
+  if (parsed.protocol !== "https:") {
+    throw new Error(`SSRF guard: only HTTPS URLs are permitted, got ${parsed.protocol}`);
+  }
+  const host = parsed.hostname;
+  if (PRIVATE_IP_RE.test(host) || host === "localhost" || host.endsWith(".local")) {
+    throw new Error(`SSRF guard: private/loopback host rejected — ${host}`);
+  }
+}
+
+// =============================================================================
 // HELPER — Call a backend Cloud Function / API
 // =============================================================================
 
 async function callCloudFunction(url, payload, timeoutMs = 25000) {
+  // Validate the URL before making any network request.
+  assertSafeUrl(url);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {

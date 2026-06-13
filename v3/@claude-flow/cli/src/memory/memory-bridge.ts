@@ -19,6 +19,7 @@
 
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { createRequire } from 'node:module';
 
 // ===== Lazy singleton =====
 
@@ -28,18 +29,40 @@ let bridgeAvailable: boolean | null = null;
 
 /**
  * Resolve database path with path traversal protection.
- * Only allows paths within or below the project's .swarm directory,
+ * Only allows paths within or below the project's working directory,
  * or the special ':memory:' path.
+ *
+ * #1945: the previous hard-coded `<cwd>/.swarm/memory.db` default ignored
+ * `CLAUDE_FLOW_MEMORY_PATH` / `claude-flow.config.json#memory.persistPath`
+ * — so users with non-default memory paths had `memory init` write to e.g.
+ * `data/memory/memory.db` while `bridgeStoreEntry()` wrote to
+ * `.swarm/memory.db`. CLI store reported success against the wrong file and
+ * a fresh process reading the configured path saw nothing.
+ *
+ * Use `getMemoryRoot()` (from memory-initializer) so the bridge and the
+ * initializer agree on the same file. Imported via require() to avoid a
+ * circular ESM dep between memory-initializer.ts and memory-bridge.ts.
  */
 function getDbPath(customPath?: string): string {
-  const swarmDir = path.resolve(process.cwd(), '.swarm');
-  if (!customPath) return path.join(swarmDir, 'memory.db');
+  let defaultDir = path.resolve(process.cwd(), '.swarm');
+  try {
+    // `getMemoryRoot()` honors $CLAUDE_FLOW_MEMORY_PATH, then the
+    // claude-flow.config.json `memory.persistPath`, then defaults to `.swarm`.
+    const cjsRequire = createRequire(import.meta.url);
+    const mod = cjsRequire('./memory-initializer.js') as { getMemoryRoot?: () => string };
+    if (typeof mod.getMemoryRoot === 'function') {
+      defaultDir = mod.getMemoryRoot();
+    }
+  } catch {
+    /* memory-initializer not resolvable in this build — keep `.swarm/` default */
+  }
+  if (!customPath) return path.join(defaultDir, 'memory.db');
   if (customPath === ':memory:') return ':memory:';
   const resolved = path.resolve(customPath);
-  // Ensure the path doesn't escape the working directory
+  // Ensure the path doesn't escape the working directory.
   const cwd = process.cwd();
   if (!resolved.startsWith(cwd)) {
-    return path.join(swarmDir, 'memory.db'); // fallback to safe default
+    return path.join(defaultDir, 'memory.db'); // fallback to safe default
   }
   return resolved;
 }
@@ -98,42 +121,205 @@ async function getRegistry(dbPath?: string): Promise<any | null> {
           console.log = origLog;
         }
 
-        // Wire intelligence module as the learning backend
-        // AgentDB's ReasoningBank/LearningSystem need a better-sqlite3 db handle
-        // which ControllerRegistry doesn't expose. Instead, use the local intelligence
-        // module (SONA + LocalReasoningBank + file persistence) for learning.
+        // Wire intelligence module as the learning backend.
+        // AgentDB's ReasoningBank/LearningSystem need a better-sqlite3 db
+        // handle which ControllerRegistry doesn't expose. Instead, use the
+        // local intelligence module (SONA + LocalReasoningBank + file
+        // persistence) for learning.
+        //
+        // PERF: parallelize the two independent post-init paths
+        // (intelligence module load + agentdb import). Previously these
+        // ran serially, adding ~50-150ms to cold start. Both can resolve
+        // concurrently because they touch disjoint controller slots.
         try {
-          const intelligence = await import('./intelligence.js');
-          const initResult = await intelligence.initializeIntelligence();
           const reg = registry as any;
 
-          if (initResult.reasoningBankEnabled) {
-            const rb = intelligence.getReasoningBank();
-            if (rb && !reg.get('reasoningBank')) {
-              if (typeof reg.set === 'function') reg.set('reasoningBank', rb);
-              else reg._controllers = { ...(reg._controllers || {}), reasoningBank: rb };
-            }
-          }
+          const intelligencePromise = (async () => {
+            try {
+              const intelligence = await import('./intelligence.js');
+              const initResult = await intelligence.initializeIntelligence();
 
-          if (initResult.sonaEnabled) {
-            const sona = intelligence.getSonaCoordinator();
-            if (sona && !reg.get('learningSystem')) {
-              if (typeof reg.set === 'function') reg.set('learningSystem', sona);
-              else reg._controllers = { ...(reg._controllers || {}), learningSystem: sona };
-            }
-          }
+              if (initResult.reasoningBankEnabled) {
+                const rb = intelligence.getReasoningBank();
+                if (rb && !reg.get('reasoningBank')) {
+                  if (typeof reg.set === 'function') reg.set('reasoningBank', rb);
+                  else reg._controllers = { ...(reg._controllers || {}), reasoningBank: rb };
+                }
+              }
 
-          // SkillLibrary from AgentDB (no db required)
-          try {
-            const agentdb = await import('agentdb');
-            if (agentdb.SkillLibrary && !reg.get('skills')) {
-              const sk = new (agentdb.SkillLibrary as any)();
-              if (typeof reg.set === 'function') reg.set('skills', sk);
-              else reg._controllers = { ...(reg._controllers || {}), skills: sk };
-            }
-          } catch { /* AgentDB not available */ }
+              if (initResult.sonaEnabled) {
+                const sona = intelligence.getSonaCoordinator();
+                if (sona && !reg.get('learningSystem')) {
+                  if (typeof reg.set === 'function') reg.set('learningSystem', sona);
+                  else reg._controllers = { ...(reg._controllers || {}), learningSystem: sona };
+                }
+              }
+            } catch { /* intelligence module not available — learning stays unwired */ }
+          })();
+
+          const agentdbPromise = (async () => {
+            // Single import shared across SkillLibrary + SemanticRouter probe.
+            let agentdb: Record<string, unknown> | null = null;
+            try { agentdb = (await import('agentdb')) as unknown as Record<string, unknown>; }
+            catch { return; /* AgentDB not available */ }
+
+            // SkillLibrary (no db required)
+            try {
+              const SkillCtor = agentdb.SkillLibrary as (new () => unknown) | undefined;
+              if (SkillCtor && !reg.get('skills')) {
+                const sk = new SkillCtor();
+                if (typeof reg.set === 'function') reg.set('skills', sk);
+                else reg._controllers = { ...(reg._controllers || {}), skills: sk };
+              }
+            } catch { /* SkillLibrary optional */ }
+
+            // ADR-093 F9: probe multiple router class names across agentdb
+            // alpha versions (alpha.10 had SemanticRouter; alpha.11+ removed
+            // it in favor of @ruvector/router; future versions may
+            // reintroduce). Wire only if .route() is callable.
+            try {
+              const candidates = ['SemanticRouter', 'IntentRouter', 'TaskRouter'] as const;
+              let routerInstance: { route?: (input: string) => Promise<unknown> | unknown } | null = null;
+              for (const name of candidates) {
+                const Ctor = agentdb[name];
+                if (typeof Ctor === 'function') {
+                  try {
+                    const inst = (() => {
+                      try { return new (Ctor as new (cfg: { dimension: number }) => unknown)({ dimension: 384 }); }
+                      catch { return new (Ctor as new () => unknown)(); }
+                    })() as { route?: (input: string) => Promise<unknown> | unknown };
+                    if (inst && typeof inst.route === 'function') {
+                      routerInstance = inst;
+                      break;
+                    }
+                  } catch { /* try next candidate */ }
+                }
+              }
+              if (routerInstance && !reg.get('semanticRouter')) {
+                if (typeof reg.set === 'function') reg.set('semanticRouter', routerInstance);
+                else reg._controllers = { ...(reg._controllers || {}), semanticRouter: routerInstance };
+              }
+            } catch { /* router optional */ }
+
+            // ADR-095 G7: load disabled-by-default controllers via direct
+            // file:// URLs from the bundled agentdb. agentdb's exports
+            // field doesn't expose these subpaths and we can't reliably
+            // patch it across pnpm-hoisted multi-version trees, so we
+            // sidestep the exports field entirely and import the file
+            // by absolute URL. Only loads controllers whose constructor
+            // is safe with no special prerequisites — others remain off
+            // pending per-controller activation ADRs.
+            try {
+              const { createRequire } = await import('node:module');
+              const { pathToFileURL } = await import('node:url');
+              const path = await import('node:path');
+              const fs = await import('node:fs');
+              const cjsRequire = createRequire(import.meta.url);
+              let adbPkgJsonPath: string | null = null;
+              try { adbPkgJsonPath = cjsRequire.resolve('agentdb/package.json'); } catch { adbPkgJsonPath = null; }
+              if (adbPkgJsonPath) {
+                const adbDir = path.dirname(adbPkgJsonPath);
+                const candidates: Array<{ name: string; relPath: string; configurable: boolean }> = [
+                  // GNNService and RVFOptimizer can construct with no args
+                  // in current agentdb — safe to activate as-is.
+                  { name: 'gnnService', relPath: 'dist/src/services/GNNService.js', configurable: false },
+                  { name: 'rvfOptimizer', relPath: 'dist/src/optimizations/RVFOptimizer.js', configurable: false },
+                  // ADR-095 G7 follow-up: MutationGuard constructs cleanly
+                  // with no args and exposes WASM-backed proof generation.
+                  // No external deps; safe-default activation.
+                  { name: 'mutationGuard', relPath: 'dist/src/security/MutationGuard.js', configurable: false },
+                  // AttestationLog needs a sqlite db handle — wired below
+                  // separately because we have to construct a db too.
+                  // GuardedVectorBackend needs key material — leave for
+                  // follow-up ADR.
+                ];
+                for (const cand of candidates) {
+                  if (reg.get(cand.name)) continue;
+                  const abs = path.join(adbDir, cand.relPath);
+                  if (!fs.existsSync(abs)) continue;
+                  try {
+                    const url = pathToFileURL(abs).href;
+                    const mod = await import(url) as Record<string, unknown>;
+                    // Look for a default export, named export matching the
+                    // file basename, or any class-typed export.
+                    const baseName = path.basename(cand.relPath, '.js');
+                    const Ctor = (mod[baseName] || mod.default ||
+                      Object.values(mod).find(v => typeof v === 'function')) as (new () => unknown) | undefined;
+                    if (typeof Ctor !== 'function') continue;
+                    const inst = new Ctor();
+                    if (typeof reg.set === 'function') reg.set(cand.name, inst);
+                    else reg._controllers = { ...(reg._controllers || {}), [cand.name]: inst };
+                  } catch { /* skip controllers that fail to construct */ }
+                }
+
+                // AttestationLog activation — needs a better-sqlite3
+                // database. We open a dedicated file at .swarm/attestation.db
+                // (separate from the main memory.db so the audit trail
+                // is isolated). Best-effort: if better-sqlite3 isn't
+                // resolvable in this env, skip cleanly.
+                let attestationInst: unknown = null;
+                if (!reg.get('attestationLog')) {
+                  try {
+                    const attestationFile = path.join(adbDir, 'dist/src/security/AttestationLog.js');
+                    if (fs.existsSync(attestationFile)) {
+                      const Database = (cjsRequire('better-sqlite3') as unknown) as new (p: string) => unknown;
+                      const swarmDir = path.resolve(process.cwd(), '.swarm');
+                      if (!fs.existsSync(swarmDir)) fs.mkdirSync(swarmDir, { recursive: true });
+                      const dbPath = path.join(swarmDir, 'attestation.db');
+                      const db = new Database(dbPath);
+                      const url = pathToFileURL(attestationFile).href;
+                      const mod = await import(url) as Record<string, unknown>;
+                      const Ctor = mod.AttestationLog as (new (cfg: { db: unknown }) => unknown) | undefined;
+                      if (typeof Ctor === 'function') {
+                        const inst = new Ctor({ db });
+                        attestationInst = inst;
+                        if (typeof reg.set === 'function') reg.set('attestationLog', inst);
+                        else reg._controllers = { ...(reg._controllers || {}), attestationLog: inst };
+                      }
+                    }
+                  } catch { /* better-sqlite3 missing or schema init failed — skip silently */ }
+                }
+
+                // ADR-095 G7 follow-up: GuardedVectorBackend wraps the
+                // existing vectorBackend with mutationGuard + attestationLog
+                // for proof-gated state mutations (ADR-060). All three
+                // dependencies are reachable here — vectorBackend is in
+                // the baseline init, mutationGuard was just activated, and
+                // attestationLog is constructed above. Skip if any piece
+                // is missing rather than constructing with undefined.
+                if (!reg.get('guardedVectorBackend')) {
+                  try {
+                    const gvbFile = path.join(adbDir, 'dist/src/backends/ruvector/GuardedVectorBackend.js');
+                    if (fs.existsSync(gvbFile)) {
+                      const inner = reg.get('vectorBackend');
+                      const guard = reg.get('mutationGuard');
+                      const log = attestationInst ?? reg.get('attestationLog');
+                      if (inner && guard) {
+                        const url = pathToFileURL(gvbFile).href;
+                        const mod = await import(url) as Record<string, unknown>;
+                        const Ctor = mod.GuardedVectorBackend as (new (i: unknown, g: unknown, l: unknown) => unknown) | undefined;
+                        if (typeof Ctor === 'function') {
+                          const inst = new Ctor(inner, guard, log);
+                          if (typeof reg.set === 'function') reg.set('guardedVectorBackend', inst);
+                          else reg._controllers = { ...(reg._controllers || {}), guardedVectorBackend: inst };
+                        }
+                      }
+                    }
+                  } catch { /* GuardedVectorBackend optional */ }
+                }
+              }
+            } catch { /* G7 wiring optional */ }
+          })();
+
+          // Run both in parallel; settle either way so a single failing
+          // path doesn't tear down the rest of the post-init wiring.
+          await Promise.allSettled([intelligencePromise, agentdbPromise]);
+
+          // Remaining disabled controllers tracked in ADR-095 G7 for
+          // per-controller activation ADRs:
+          //   - graphAdapter (graph DB adapter — needs graph DB connection)
         } catch {
-          // Intelligence module not available — learning stays unwired
+          // Top-level catch — registry stays usable even if post-init wiring fails wholesale.
         }
 
         registryInstance = registry;
@@ -342,7 +528,96 @@ function getDb(registry: any): any | null {
     // Table already exists or db is read-only — that's fine
   }
 
+  // ─── #2256-followup: rescue agentdb.embedder when its transformers.js
+  // path fell through to mock embeddings.
+  //
+  // What was happening: agentdb's `EmbeddingService.initialize()` always
+  // tries `@xenova/transformers` first, which transitively requires `sharp`
+  // → `libvips`. On macOS arm64 systems without `brew install vips`, sharp
+  // fails to load and agentdb silently falls back to MOCK EMBEDDINGS
+  // (random vectors). The bridge then calls `agentdb.embedder.embed(...)`
+  // and gets garbage; semantic search returns no useful matches.
+  //
+  // In our process, `memory-initializer.ts::loadEmbeddingModel()` already
+  // tried this same chain and ALSO has a working ruvector-ONNX fallback
+  // that the user typically reaches before the bridge initialises. The
+  // ruvector ONNX model has been loaded; the agentdb instance just doesn't
+  // know about it. We monkey-patch `embed`/`embedBatch` to delegate to our
+  // `generateEmbedding()` so the bridge gets real vectors.
+  //
+  // Detection signal: `embedder.pipeline === null` after init means
+  // transformers failed and agentdb would otherwise use mockEmbedding().
+  // Patch is idempotent (`__ruvectorRescued` sentinel) and a no-op if
+  // ruvector is also unavailable.
+  rescueAgentdbEmbedder(agentdb).catch(() => { /* non-fatal */ });
+
   return { db, agentdb };
+}
+
+// One-shot guard so we only patch once per process — the embedder is shared
+// by ReflexionMemory/SkillLibrary/CausalRecall and they all see the same
+// object reference.
+let _embedderPatched = false;
+async function rescueAgentdbEmbedder(agentdb: { embedder?: { pipeline?: unknown; embed?: (t: string) => Promise<Float32Array>; embedBatch?: (ts: string[]) => Promise<Float32Array[]>; __ruvectorRescued?: boolean } }): Promise<void> {
+  if (_embedderPatched) return;
+  const emb = agentdb?.embedder;
+  if (!emb || emb.__ruvectorRescued) return;
+
+  // Only rescue when transformers.js initialisation failed: that's
+  // signalled by a null pipeline. If transformers IS working, agentdb's
+  // own embed() does the right thing and we should not interpose.
+  if (emb.pipeline) return;
+
+  // #2312: delegate to generateLOCALEmbedding, NOT generateEmbedding.
+  // generateEmbedding is bridge-first — routing the rescued embed through it
+  // closes a cycle (generateEmbedding → bridgeGenerateEmbedding →
+  // embedder.embed [patched] → generateEmbedding → …) that allocated
+  // unboundedly via microtasks until V8 hit the heap limit (~4 GB on the CI
+  // runner, SIGABRT 134). The local chain never consults the bridge, so the
+  // rescued embedder is a leaf. If the running memory-initializer build
+  // predates generateLocalEmbedding, decline the rescue entirely — a stale
+  // pairing must fail safe, not recurse.
+  type EmbedFn = (text: string) => Promise<{ embedding: number[] | Float32Array; dimensions: number; model: string; backend?: 'onnx' | 'mock' }>;
+  let localEmbed: EmbedFn | null = null;
+  try {
+    const mod = (await import('./memory-initializer.js')) as unknown as { generateLocalEmbedding?: EmbedFn };
+    localEmbed = mod.generateLocalEmbedding ?? null;
+  } catch {
+    return; // can't import the rescuer — leave the mock fallback alone
+  }
+  if (!localEmbed) return;
+  const embed: EmbedFn = localEmbed;
+
+  // Probe once to confirm the rescuer actually returns REAL ONNX vectors
+  // (#2312: the old probe only checked non-zero, which the deterministic
+  // hash fallback also satisfies — so it "rescued" agentdb's mock with our
+  // own mock and reported it as real). Require backend === 'onnx'.
+  try {
+    const probe = await embed('rescue-probe');
+    const arr = probe?.embedding ? Array.from(probe.embedding as ArrayLike<number>) : [];
+    const hasSignal = arr.length > 0 && arr.some((v: number) => Math.abs(v) > 1e-9);
+    if (!hasSignal || probe.backend !== 'onnx') {
+      // Local chain is also degraded — leave agentdb's embedder alone, but
+      // tag it so bridgeGenerateEmbedding's AUDIT-#3 isMock check reports
+      // backend='mock' truthfully instead of labeling mock vectors 'onnx'.
+      try { (emb as { backend?: string }).backend = 'mock'; } catch { /* frozen */ }
+      return;
+    }
+  } catch {
+    return;
+  }
+
+  const newEmbed = async (text: string): Promise<Float32Array> => {
+    const out = await embed(text);
+    return out.embedding instanceof Float32Array
+      ? out.embedding
+      : new Float32Array((out.embedding as number[]) ?? []);
+  };
+  emb.embed = newEmbed;
+  emb.embedBatch = async (texts: string[]): Promise<Float32Array[]> =>
+    Promise.all(texts.map(t => newEmbed(t)));
+  emb.__ruvectorRescued = true;
+  _embedderPatched = true;
 }
 
 // ===== Bridge functions — match memory-initializer.ts signatures =====
@@ -381,6 +656,13 @@ export async function bridgeStoreEntry(options: {
     const { key, value, namespace = 'default', tags = [], ttl } = options;
     const id = generateId('entry');
     const now = Date.now();
+
+    // #2245 — record the activity so signalsProcessed stops being a dead
+    // zero. Fire-and-forget; never blocks the write path.
+    try {
+      const intel = await import('./intelligence.js');
+      intel.recordSignalProcessed();
+    } catch { /* intelligence module not yet initialised */ }
 
     // Phase 5: MutationGuard validation before write
     const guardResult = await guardValidate(registry, 'store', { key, namespace, size: value.length });
@@ -421,6 +703,17 @@ export async function bridgeStoreEntry(options: {
           embedding, embedding_dimensions, embedding_model,
           tags, metadata, created_at, updated_at, expires_at, status
         ) VALUES (?, ?, ?, ?, 'semantic', ?, ?, ?, ?, ?, ?, ?, ?, 'active')`;
+
+    // #1941: provision a `vector_indexes` row for this namespace before the
+    // entry insert. AgentDB's HNSW/router keys lookups by namespace via this
+    // table — if it has no row for e.g. `claude-memories`, `memory_search`
+    // returns 0 results even when memory_entries holds hundreds of rows for
+    // that namespace. INSERT OR IGNORE so existing index rows are preserved.
+    try {
+      ctx.db
+        .prepare(`INSERT OR IGNORE INTO vector_indexes (id, name, dimensions) VALUES (?, ?, ?)`)
+        .run(namespace, namespace, dimensions || 384);
+    } catch { /* vector_indexes may not exist on legacy DBs — fall through */ }
 
     const stmt = ctx.db.prepare(insertSql);
     stmt.run(
@@ -594,6 +887,8 @@ export async function bridgeListEntries(options: {
   limit?: number;
   offset?: number;
   dbPath?: string;
+  /** #2073: When true, include the entry's full `content` string in each result. */
+  includeContent?: boolean;
 }): Promise<{
   success: boolean;
   entries: {
@@ -605,6 +900,8 @@ export async function bridgeListEntries(options: {
     createdAt: string;
     updatedAt: string;
     hasEmbedding: boolean;
+    /** #2073: Present when `includeContent: true` was requested. */
+    content?: string;
   }[];
   total: number;
   error?: string;
@@ -621,11 +918,21 @@ export async function bridgeListEntries(options: {
     const nsFilter = namespace ? `AND namespace = ?` : '';
     const nsParams = namespace ? [namespace] : [];
 
+    // #2120 — `status IS NULL` accepted alongside `'active'`. Old
+    // databases imported by the auto-memory bridge (before the status
+    // column existed) end up with NULL status after schema migration if
+    // the migration ran on an existing DB without a backfill. Reporter
+    // @alexandrelealbess on WSL2 had 251 entries with NULL status, so
+    // the `status = 'active'` filter matched zero. Treat NULL as
+    // "legacy-active" — the safe default for any entry that predates the
+    // status column.
+    const statusFilter = `(status = 'active' OR status IS NULL)`;
+
     // Count
     let total = 0;
     try {
       const countStmt = ctx.db.prepare(
-        `SELECT COUNT(*) as cnt FROM memory_entries WHERE status = 'active' ${nsFilter}`
+        `SELECT COUNT(*) as cnt FROM memory_entries WHERE ${statusFilter} ${nsFilter}`
       );
       const countRow = countStmt.get(...nsParams);
       total = countRow?.cnt ?? 0;
@@ -639,14 +946,16 @@ export async function bridgeListEntries(options: {
       const stmt = ctx.db.prepare(`
         SELECT id, key, namespace, content, embedding, access_count, created_at, updated_at
         FROM memory_entries
-        WHERE status = 'active' ${nsFilter}
+        WHERE ${statusFilter} ${nsFilter}
         ORDER BY updated_at DESC
         LIMIT ? OFFSET ?
       `);
       const rows = stmt.all(...nsParams, limit, offset);
       for (const row of rows) {
-        entries.push({
-          id: String(row.id).substring(0, 20),
+        const entry: Record<string, unknown> = {
+          // #2073: don't truncate id when content is requested — callers
+          // (notably memory_export) need the full id to round-trip via import.
+          id: options.includeContent ? String(row.id) : String(row.id).substring(0, 20),
           key: row.key || String(row.id).substring(0, 15),
           namespace: row.namespace || 'default',
           size: (row.content || '').length,
@@ -654,7 +963,11 @@ export async function bridgeListEntries(options: {
           createdAt: row.created_at || new Date().toISOString(),
           updatedAt: row.updated_at || new Date().toISOString(),
           hasEmbedding: !!(row.embedding && String(row.embedding).length > 10),
-        });
+        };
+        if (options.includeContent) {
+          entry.content = row.content || '';
+        }
+        entries.push(entry);
       }
     } catch {
       return null;
@@ -861,7 +1174,7 @@ export async function bridgeDeleteEntry(options: {
 export async function bridgeGenerateEmbedding(
   text: string,
   dbPath?: string,
-): Promise<{ embedding: number[]; dimensions: number; model: string } | null> {
+): Promise<{ embedding: number[]; dimensions: number; model: string; backend?: 'onnx' | 'mock' } | null> {
   const registry = await getRegistry(dbPath);
   if (!registry) return null;
 
@@ -873,10 +1186,16 @@ export async function bridgeGenerateEmbedding(
     const emb = await embedder.embed(text);
     if (!emb) return null;
 
+    // AUDIT #3: surface backend truthfully. AgentDB's embedder is a real ONNX
+    // model when present; if it ever exposes a mock/stub signal, honor it.
+    const isMock = (embedder as { isMock?: boolean; backend?: string }).isMock === true
+      || (embedder as { backend?: string }).backend === 'mock';
+
     return {
       embedding: Array.from(emb),
       dimensions: emb.length,
       model: 'Xenova/all-MiniLM-L6-v2',
+      backend: isMock ? 'mock' : 'onnx',
     };
   } catch {
     return null;
@@ -1256,6 +1575,42 @@ export async function bridgeSearchPatterns(options: {
       };
     }
 
+    // #2226 — the wired-in LocalReasoningBank implements store() + findSimilar()/getAll()
+    // but NOT searchPatterns()/search(). bridgeStorePattern commits patterns to its
+    // store(), so search MUST read the SAME backend or stored patterns are never found
+    // (previously search fell through to the disjoint sql.js 'pattern' namespace, which
+    // the store never wrote to → always-empty results). Adapt findSimilar (semantic) with
+    // a getAll() substring fallback so freshly-stored patterns are visible. This mirrors
+    // what hooks_intelligence_pattern-search already does against the same backend.
+    if (reasoningBank && typeof reasoningBank.findSimilar === 'function') {
+      const k = options.topK || 5;
+      const threshold = options.minConfidence ?? 0.3;
+      let mapped: Array<{ id: string; content: string; score: number }> = [];
+      try {
+        const { generateEmbedding } = await import('./memory-initializer.js');
+        const qEmb = await generateEmbedding(options.query);
+        if (qEmb && Array.isArray(qEmb.embedding) && qEmb.embedding.length > 0) {
+          const hits = reasoningBank.findSimilar(qEmb.embedding, { k, threshold });
+          mapped = (Array.isArray(hits) ? hits : []).map((r: any) => ({
+            id: r.id ?? '',
+            content: r.content ?? '',
+            score: r.confidence ?? r.score ?? 0,
+          }));
+        }
+      } catch { /* embedding unavailable — fall through to substring scan */ }
+
+      // Deterministic substring fallback over the same in-memory store.
+      if (mapped.length === 0 && typeof reasoningBank.getAll === 'function') {
+        const q = options.query.toLowerCase();
+        mapped = (reasoningBank.getAll() as any[])
+          .filter((p: any) => typeof p.content === 'string' && p.content.toLowerCase().includes(q))
+          .slice(0, k)
+          .map((p: any) => ({ id: p.id ?? '', content: p.content ?? '', score: p.confidence ?? 0 }));
+      }
+
+      return { results: mapped, controller: 'reasoningBank' };
+    }
+
     // Fallback: search via bridge
     const result = await bridgeSearchEntries({
       query: options.query,
@@ -1288,6 +1643,12 @@ export async function bridgeRecordFeedback(options: {
   duration?: number;
   patterns?: string[];
   dbPath?: string;
+  // ADR-147 P2: nested-subagent spawn tree capture.
+  // parentAgentId is sourced from Claude Code's `parent_agent_id` OTel span tag
+  // (header `x-claude-code-parent-agent-id`). depth is the chain length from the
+  // root lead session (0 = lead, 1+ = subagent). Both undefined for top-level work.
+  parentAgentId?: string;
+  depth?: number;
 }): Promise<{ success: boolean; controller: string; updated: number } | null> {
   const registry = await getRegistry(options.dbPath);
   if (!registry) return null;
@@ -1304,6 +1665,8 @@ export async function bridgeRecordFeedback(options: {
           await learningSystem.recordFeedback({
             taskId: options.taskId, success: options.success, quality: options.quality,
             agent: options.agent, duration: options.duration, timestamp: Date.now(),
+            // ADR-147 P2: forward spawn-tree lineage if present
+            parentAgentId: options.parentAgentId, depth: options.depth,
           });
           controller = 'learningSystem';
           updated++;
@@ -1408,6 +1771,301 @@ export async function bridgeRecordCausalEdge(options: {
     }
 
     return null;
+  } catch {
+    return null;
+  }
+}
+
+// ===== #1784: Delete tools for hierarchical + causal-graph =====
+
+/**
+ * Delete a hierarchical-memory entry by key (#1784).
+ *
+ * Reality check: agentdb's HierarchicalMemory class doesn't expose a public
+ * delete API today, so the real-backend path falls back to direct SQL on
+ * the underlying SQLite tables (status flip to 'deleted' + AttestationLog
+ * audit). The bridge-fallback path that bridgeHierarchicalStore uses when
+ * HierarchicalMemory isn't loaded writes plain memory_entries rows that
+ * `bridgeDeleteEntry` already handles.
+ *
+ * Returns { controller: 'native-unsupported' } when the real HM is loaded
+ * and the SQL fallback can't reach its private tables — surfacing the
+ * limitation honestly instead of silently returning success.
+ */
+export async function bridgeDeleteHierarchical(options: {
+  key: string;
+  tier?: string;
+  dbPath?: string;
+}): Promise<{
+  success: boolean;
+  deleted: boolean;
+  key: string;
+  tier?: string;
+  controller: string;
+  guarded?: boolean;
+  error?: string;
+} | null> {
+  const registry = await getRegistry(options.dbPath);
+  if (!registry) return null;
+  try {
+    const { key, tier } = options;
+
+    // MutationGuard validation
+    const guardResult = await guardValidate(registry, 'delete', { key, namespace: 'hierarchical' });
+    if (!guardResult.allowed) {
+      return { success: false, deleted: false, key, tier, controller: 'guard', error: `MutationGuard rejected: ${guardResult.reason}` };
+    }
+
+    const hm = registry.get('hierarchicalMemory');
+
+    // 1. agentdb@3.0.0-alpha.13+: ReflexionMemory.deleteEpisode propagates through
+    //    graph adapter / generic graph backend / vector backend AND purges SQL
+    //    episodes + episode_embeddings rows. Single call, durably consistent.
+    //    See agentic-flow#150/#151 (closes ruvnet/RuVector#427 the cli-visible way).
+    const reflexion = registry.get('reflexionMemory');
+    if (reflexion && typeof reflexion.deleteEpisode === 'function') {
+      try {
+        const removed = await reflexion.deleteEpisode(key);
+        if (removed) {
+          await logAttestation(registry, 'delete', key, { namespace: 'hierarchical', tier });
+          return { success: true, deleted: true, key, tier, controller: 'reflexionMemory', guarded: true };
+        }
+      } catch { /* fall through */ }
+    }
+
+    // 2. Try HierarchicalMemory's own delete API if it ever ships one.
+    if (hm && typeof hm.delete === 'function') {
+      try {
+        await hm.delete(key);
+        await logAttestation(registry, 'delete', key, { namespace: 'hierarchical', tier });
+        return { success: true, deleted: true, key, tier, controller: 'hierarchicalMemory', guarded: true };
+      } catch (err) {
+        // Fall through to SQL fallback
+      }
+    }
+
+    // 3. Stub HierarchicalMemory may expose `remove` or `forget`
+    if (hm && typeof hm.remove === 'function') {
+      try {
+        await hm.remove(key);
+        await logAttestation(registry, 'delete', key, { namespace: 'hierarchical', tier });
+        return { success: true, deleted: true, key, tier, controller: 'hierarchicalMemory-stub', guarded: true };
+      } catch { /* fall through */ }
+    }
+
+    // 3. Bridge-fallback: HM stored to memory_entries with namespace prefix
+    //    (used when the real controller isn't loaded). Soft-delete via SQL.
+    const ctx = getDb(registry);
+    if (ctx) {
+      try {
+        const result = ctx.db.prepare(`
+          UPDATE memory_entries
+          SET status = 'deleted', updated_at = ?
+          WHERE key = ? AND namespace LIKE 'hierarchical%' AND status = 'active'
+        `).run(Date.now(), key);
+        const changes = result?.changes ?? 0;
+        if (changes > 0) {
+          await logAttestation(registry, 'delete', key, { namespace: 'hierarchical', tier });
+          return { success: true, deleted: true, key, tier, controller: 'bridge-fallback', guarded: true };
+        }
+        // Nothing to delete in SQL fallback — and no real-HM delete API.
+        // Surface the situation honestly.
+        return {
+          success: false, deleted: false, key, tier,
+          controller: hm ? 'native-unsupported' : 'not-found',
+          error: hm
+            ? 'HierarchicalMemory has no public delete API; entry remains in native storage'
+            : 'No hierarchical entry found with this key',
+        };
+      } catch (err) {
+        return { success: false, deleted: false, key, tier, controller: 'sql-error', error: (err as Error).message };
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Delete a causal edge between two memory entries (#1784).
+ *
+ * The bridge stores fallback edges in namespace='causal-edges' with key
+ * '{sourceId}→{targetId}'. Those CAN be soft-deleted. The native graph-node
+ * backend has no delete API (createNode/createEdge/createHyperedge only),
+ * so an edge that landed in graph-node native storage stays there. We
+ * surface that explicitly via controller: 'native-unsupported'.
+ */
+export async function bridgeDeleteCausalEdge(options: {
+  sourceId: string;
+  targetId: string;
+  relation?: string;
+  dbPath?: string;
+}): Promise<{
+  success: boolean;
+  deleted: boolean;
+  sourceId: string;
+  targetId: string;
+  controller: string;
+  guarded?: boolean;
+  error?: string;
+} | null> {
+  const registry = await getRegistry(options.dbPath);
+  if (!registry) return null;
+  try {
+    const { sourceId, targetId, relation } = options;
+    const edgeKey = `${sourceId}→${targetId}`;
+
+    const guardResult = await guardValidate(registry, 'delete', { key: edgeKey, namespace: 'causal-edges' });
+    if (!guardResult.allowed) {
+      return { success: false, deleted: false, sourceId, targetId, controller: 'guard', error: `MutationGuard rejected: ${guardResult.reason}` };
+    }
+
+    const causalGraph = registry.get('causalGraph');
+
+    // 1. agentdb@3.0.0-alpha.13+: GraphDatabaseAdapter.deleteEdgesByEndpoints
+    //    handles the (sourceId, targetId, relation?) tuple case directly via
+    //    Cypher MATCH … DETACH DELETE. Cypher-injection-safe (label validated
+    //    against /^[A-Za-z_][A-Za-z0-9_]*$/ upstream).
+    if (causalGraph && typeof causalGraph.deleteEdgesByEndpoints === 'function') {
+      try {
+        const r = await causalGraph.deleteEdgesByEndpoints(sourceId, targetId, relation);
+        const deletedCount = typeof r === 'object' && r ? (r.deleted ?? 0) : (r ? 1 : 0);
+        if (deletedCount > 0) {
+          await logAttestation(registry, 'delete', edgeKey, { namespace: 'causal-edges', relation, count: deletedCount });
+          return { success: true, deleted: true, sourceId, targetId, controller: 'causalGraph-cypher', guarded: true };
+        }
+      } catch { /* fall through */ }
+    }
+
+    // 2. Pre-alpha.13 / different controller: try removeEdge() if exposed.
+    if (causalGraph && typeof causalGraph.removeEdge === 'function') {
+      try {
+        await causalGraph.removeEdge(sourceId, targetId, relation);
+        await logAttestation(registry, 'delete', edgeKey, { namespace: 'causal-edges', relation });
+        return { success: true, deleted: true, sourceId, targetId, controller: 'causalGraph', guarded: true };
+      } catch { /* fall through */ }
+    }
+
+    // 2. Bridge-fallback: soft-delete the memory_entries row.
+    const ctx = getDb(registry);
+    if (ctx) {
+      try {
+        const result = ctx.db.prepare(`
+          UPDATE memory_entries
+          SET status = 'deleted', updated_at = ?
+          WHERE key = ? AND namespace = 'causal-edges' AND status = 'active'
+        `).run(Date.now(), edgeKey);
+        const changes = result?.changes ?? 0;
+        if (changes > 0) {
+          await logAttestation(registry, 'delete', edgeKey, { namespace: 'causal-edges', relation });
+          return { success: true, deleted: true, sourceId, targetId, controller: 'bridge-fallback', guarded: true };
+        }
+        return {
+          success: false, deleted: false, sourceId, targetId,
+          controller: 'native-unsupported',
+          error: 'graph-node native backend has no delete API; edge cannot be removed from native storage. SQL fallback found no matching row.',
+        };
+      } catch (err) {
+        return { success: false, deleted: false, sourceId, targetId, controller: 'sql-error', error: (err as Error).message };
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cascade-delete a causal node and all its incident edges (#1784).
+ *
+ * Same constraint as bridgeDeleteCausalEdge — native graph-node lacks a
+ * delete API. SQL fallback path soft-deletes the node (if stored as a
+ * memory_entries row) and every edge whose key contains the nodeId.
+ */
+export async function bridgeDeleteCausalNode(options: {
+  nodeId: string;
+  dbPath?: string;
+}): Promise<{
+  success: boolean;
+  deletedNode: boolean;
+  deletedEdges: number;
+  nodeId: string;
+  controller: string;
+  guarded?: boolean;
+  error?: string;
+} | null> {
+  const registry = await getRegistry(options.dbPath);
+  if (!registry) return null;
+  try {
+    const { nodeId } = options;
+
+    const guardResult = await guardValidate(registry, 'delete', { key: nodeId, namespace: 'causal-nodes' });
+    if (!guardResult.allowed) {
+      return { success: false, deletedNode: false, deletedEdges: 0, nodeId, controller: 'guard', error: `MutationGuard rejected: ${guardResult.reason}` };
+    }
+
+    // 1. agentdb@3.0.0-alpha.13+: GraphDatabaseAdapter.deleteNode(id, {cascade})
+    //    counts incident edges before delete so we get accurate audit numbers
+    //    regardless of binding stats. Cypher MATCH (n {id}) DETACH DELETE n.
+    const causalGraph = registry.get('causalGraph');
+    if (causalGraph && typeof causalGraph.deleteNode === 'function') {
+      try {
+        const r = await causalGraph.deleteNode(nodeId, { cascade: true });
+        if (r && typeof r === 'object') {
+          const deletedNodeNative = !!r.deletedNode;
+          const deletedEdgesNative = typeof r.deletedEdges === 'number' ? r.deletedEdges : 0;
+          await logAttestation(registry, 'delete', nodeId, { namespace: 'causal-nodes', deletedEdges: deletedEdgesNative });
+          return {
+            success: true,
+            deletedNode: deletedNodeNative,
+            deletedEdges: deletedEdgesNative,
+            nodeId,
+            controller: 'causalGraph-cypher',
+            guarded: true,
+          };
+        }
+      } catch { /* fall through to SQL */ }
+    }
+
+    // 2. SQL fallback: soft-delete the node row + every causal-edges row whose
+    //    key contains nodeId on either side. Used when agentdb pre-alpha.13 OR
+    //    when the entry was stored via the bridge's SQL fallback path.
+    const ctx = getDb(registry);
+    if (!ctx) return null;
+
+    let deletedEdges = 0;
+    let deletedNode = false;
+    try {
+      const edgeResult = ctx.db.prepare(`
+        UPDATE memory_entries
+        SET status = 'deleted', updated_at = ?
+        WHERE namespace = 'causal-edges'
+          AND status = 'active'
+          AND (key LIKE ? OR key LIKE ?)
+      `).run(Date.now(), `${nodeId}→%`, `%→${nodeId}`);
+      deletedEdges = edgeResult?.changes ?? 0;
+
+      const nodeResult = ctx.db.prepare(`
+        UPDATE memory_entries
+        SET status = 'deleted', updated_at = ?
+        WHERE key = ? AND status = 'active'
+      `).run(Date.now(), nodeId);
+      deletedNode = (nodeResult?.changes ?? 0) > 0;
+
+      await logAttestation(registry, 'delete', nodeId, { namespace: 'causal-nodes', deletedEdges });
+    } catch (err) {
+      return { success: false, deletedNode: false, deletedEdges: 0, nodeId, controller: 'sql-error', error: (err as Error).message };
+    }
+
+    return {
+      success: true,
+      deletedNode,
+      deletedEdges,
+      nodeId,
+      controller: 'bridge-fallback',
+      guarded: true,
+    };
   } catch {
     return null;
   }
@@ -1823,10 +2481,20 @@ export async function bridgeSemanticRoute(params: { input: string }): Promise<an
   if (!registry) return null;
   try {
     const router = registry.get('semanticRouter');
-    if (!router) return { route: null, error: 'SemanticRouter not available' };
+    if (!router) {
+      // ADR-093 F9: surface an actionable error pointing callers at the
+      // alternative routing surfaces that DO work, instead of just
+      // saying "not available".
+      return {
+        route: null,
+        error: 'SemanticRouter not available in current agentdb build',
+        recommendation: 'Use bridgeRouteTask (registers as `agentdb_route` MCP tool) for keyword+pattern routing, or hooks_model-route for ADR-026 model selection.',
+        controller: 'none',
+      };
+    }
     const result = await router.route(params.input);
     return { route: result, controller: 'semanticRouter' };
-  } catch (e: any) { return { route: null, error: e.message }; }
+  } catch (e: any) { return { route: null, error: e.message, controller: 'error' }; }
 }
 
 // ===== RaBitQ data export =====
@@ -1899,4 +2567,47 @@ function cosineSim(a: number[], b: number[]): number {
   }
   const mag = Math.sqrt(normA * normB);
   return mag === 0 ? 0 : dot / mag;
+}
+
+/**
+ * Public helper for the unified learning-stats aggregator: counts of entries
+ * per namespace + the top-level total. Best-effort — if the bridge isn't
+ * available it returns zeros so the aggregator can still report the other
+ * stores honestly. (#2245 follow-up.)
+ */
+export async function getMemoryBridgeStats(options: {
+  namespaces?: string[];
+  dbPath?: string;
+} = {}): Promise<{
+  totalEntries: number;
+  perNamespace: Record<string, number>;
+  source: string;
+  reachable: boolean;
+}> {
+  const namespaces = options.namespaces ?? [
+    'default', 'patterns', 'claude-memories', 'auto-memory',
+    'tasks', 'feedback', 'pretrain', 'trajectories',
+  ];
+  try {
+    const all = await bridgeListEntries({ dbPath: options.dbPath, limit: 1 });
+    if (!all) {
+      return { totalEntries: 0, perNamespace: {}, source: 'memory-bridge (unreachable)', reachable: false };
+    }
+    const perNamespace: Record<string, number> = {};
+    for (const ns of namespaces) {
+      try {
+        const r = await bridgeListEntries({ namespace: ns, dbPath: options.dbPath, limit: 1 });
+        const n = r?.total ?? 0;
+        if (n > 0) perNamespace[ns] = n;
+      } catch { /* skip per-namespace failure */ }
+    }
+    return {
+      totalEntries: all.total,
+      perNamespace,
+      source: 'memory-bridge AgentDB (bridgeListEntries)',
+      reachable: true,
+    };
+  } catch {
+    return { totalEntries: 0, perNamespace: {}, source: 'memory-bridge (error)', reachable: false };
+  }
 }

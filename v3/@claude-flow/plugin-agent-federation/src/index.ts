@@ -1,6 +1,35 @@
 export { AgentFederationPlugin } from './plugin.js';
 
-export { FederationNode, type FederationNodeProps, type FederationNodeCapabilities, type FederationNodeMetadata } from './domain/entities/federation-node.js';
+export { FederationNode, type FederationNodeProps, type FederationNodeCapabilities, type FederationNodeMetadata, type FederationNodeStateRecord } from './domain/entities/federation-node.js';
+export {
+  FederationNodeState,
+  type SuspensionReason,
+  type TransitionReason,
+  canTransition,
+  isCooldownElapsed,
+  shouldAutoEvict,
+  DEFAULT_SUSPENSION_COOLDOWN_MS,
+  DEFAULT_AUTO_EVICTION_AGE_MS,
+} from './domain/value-objects/federation-node-state.js';
+export {
+  FederationBreakerService,
+  evaluatePolicy,
+  DEFAULT_BREAKER_POLICY,
+  DEFAULT_MAX_SAMPLES_PER_PEER,
+  type BreakerPolicy,
+  type BreakerDecision,
+  type SendOutcome,
+} from './application/federation-breaker-service.js';
+export {
+  InMemorySpendReporter,
+  MemorySpendReporter,
+  DEFAULT_FEDERATION_SPEND_NAMESPACE,
+  DEFAULT_FEDERATION_SPEND_TTL_SECONDS,
+  type SpendReporter,
+  type MemoryStore,
+  type MemorySpendReporterConfig,
+  type FederationSpendEvent,
+} from './application/spend-reporter.js';
 export { FederationSession, type FederationSessionProps, type SessionMetrics } from './domain/entities/federation-session.js';
 export {
   FederationEnvelope,

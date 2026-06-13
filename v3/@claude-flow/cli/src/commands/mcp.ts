@@ -9,6 +9,7 @@
 import type { Command, CommandContext, CommandResult } from '../types.js';
 import { output } from '../output.js';
 import { select, confirm } from '../prompt.js';
+import { installParentDeathWatchdog } from '../runtime/parent-death-watchdog.js';
 import {
   MCPServerManager,
   createMCPServerManager,
@@ -184,6 +185,17 @@ const startCommand: Command = {
 
       // Start the server
       const status = await manager.start();
+
+      // #2234 — exit cleanly if Claude Code (our parent) exits and we get
+      // reparented to launchd/init (ppid === 1). Otherwise the node stdio
+      // server lingers as an orphan, accumulating ~50 MB per restart, and an
+      // arbitrary stale orphan can later win the stdio handshake and serve
+      // pre-fix code from the user's npx cache.
+      installParentDeathWatchdog({
+        onOrphaned: async () => {
+          try { await manager.stop(); } catch { /* best-effort */ }
+        },
+      });
 
       output.writeln();
       output.printTable({

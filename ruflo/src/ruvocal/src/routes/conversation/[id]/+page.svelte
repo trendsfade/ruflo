@@ -233,6 +233,10 @@
 					})),
 					streamingMode,
 					autopilot: $settings.autopilotEnabled === true,
+					autopilotMaxSteps:
+						typeof $settings.autopilotMaxSteps === "number"
+							? $settings.autopilotMaxSteps
+							: undefined,
 				},
 				messageUpdatesAbortController.signal
 			).catch((err) => {

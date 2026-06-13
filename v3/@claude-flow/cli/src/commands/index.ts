@@ -52,6 +52,8 @@ const commandLoaders: Record<string, CommandLoader> = {
   // P0 Commands
   completions: () => import('./completions.js'),
   doctor: () => import('./doctor.js'),
+  // Verification (ADR-095, signed witness manifest)
+  verify: () => import('./verify.js'),
   // Analysis Commands
   analyze: () => import('./analyze.js'),
   // Q-Learning Routing Commands
@@ -74,6 +76,8 @@ const commandLoaders: Record<string, CommandLoader> = {
   'transfer-store': () => import('./transfer-store.js'),
   cleanup: () => import('./cleanup.js'),
   autopilot: () => import('./autopilot.js'),
+  // GAIA Benchmark Harness (ADR-133)
+  'gaia-bench': () => import('./gaia-bench.js'),
 };
 
 // Cache for loaded commands

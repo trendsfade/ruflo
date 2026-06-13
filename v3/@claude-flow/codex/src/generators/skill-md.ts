@@ -14,12 +14,18 @@ export async function generateSkillMd(options: SkillMdOptions): Promise<string> 
   const {
     name,
     description,
+    version = '1.0.0',
+    author = 'rUv',
+    tags,
     triggers = [],
     skipWhen = [],
     scripts = [],
     references = [],
     commands = [],
   } = options;
+
+  // Derive discovery tags from the skill name when not supplied explicitly.
+  const tagList = tags && tags.length > 0 ? tags : name.split('-').filter(Boolean);
 
   // Build YAML frontmatter
   const triggerText = triggers.length > 0
@@ -31,6 +37,9 @@ export async function generateSkillMd(options: SkillMdOptions): Promise<string> 
 
   const frontmatter = `---
 name: ${name}
+version: "${version}"
+author: ${author}
+tags: [${tagList.join(', ')}]
 description: >
   ${description}
   ${triggerText}
@@ -167,8 +176,8 @@ export async function generateBuiltInSkill(
         {
           name: 'Initialize Swarm',
           description: 'Start a new swarm with hierarchical topology (anti-drift)',
-          command: 'npx @claude-flow/cli swarm init --topology hierarchical --max-agents 8 --strategy specialized',
-          example: 'npx @claude-flow/cli swarm init --topology hierarchical --max-agents 6 --strategy specialized',
+          command: 'npx ruflo swarm init --topology hierarchical --max-agents 8 --strategy specialized',
+          example: 'npx ruflo swarm init --topology hierarchical --max-agents 6 --strategy specialized',
         },
         {
           name: 'Route Task',
@@ -719,7 +728,7 @@ function generateHelperScript(skillName: string, scriptName: string): string {
 set -e
 
 echo "Initializing hierarchical swarm..."
-npx @claude-flow/cli swarm init \\
+npx ruflo swarm init \\
   --topology hierarchical \\
   --max-agents 8 \\
   --strategy specialized

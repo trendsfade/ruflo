@@ -53,7 +53,7 @@ The pathfinder traversal algorithm finds relevant subgraphs:
 - `mcp__claude-flow__agentdb_pattern-store` -- store discovered graph patterns
 - `mcp__claude-flow__agentdb_pattern-search` -- search for similar graph structures
 - `mcp__claude-flow__agentdb_context-synthesize` -- synthesize context from multiple graph nodes
-- `mcp__claude-flow__embeddings_embed` -- generate embeddings for entity descriptions
+- `mcp__claude-flow__embeddings_generate` -- generate embeddings for entity descriptions
 
 ### Neural Learning
 

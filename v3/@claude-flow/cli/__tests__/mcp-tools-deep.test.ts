@@ -421,6 +421,8 @@ describe('MCP Tools Deep Test Suite', () => {
     it('tool name prefix matches category when category is set', () => {
       const exceptions = new Set([
         'mcp_status',      // system-tools exports mcp_status
+        'mcp_start',       // system-tools exports mcp_start (#1916 — in-process no-op)
+        'mcp_stop',        // system-tools exports mcp_stop (#1916 — in-process no-op)
         'task_summary',    // system-tools exports task_summary
       ]);
 

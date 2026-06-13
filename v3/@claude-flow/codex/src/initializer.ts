@@ -152,7 +152,7 @@ export class CodexInitializer {
       // Register MCP server with Codex
       const mcpResult = await this.registerMCPServer();
       if (mcpResult.registered) {
-        filesCreated.push('MCP server (claude-flow) registered');
+        filesCreated.push('MCP server (ruflo) registered');
       }
       if (mcpResult.warning) {
         warnings.push(mcpResult.warning);
@@ -326,14 +326,14 @@ export class CodexInitializer {
       } catch {
         return {
           registered: false,
-          warning: 'Codex CLI not found. Run: codex mcp add claude-flow -- npx claude-flow mcp start',
+          warning: 'Codex CLI not found. Run: codex mcp add ruflo -- npx ruflo mcp start',
         };
       }
 
       // Check if already registered
       try {
         const list = execSync('codex mcp list 2>&1', { encoding: 'utf-8' });
-        if (list.includes('claude-flow')) {
+        if (list.includes('ruflo')) {
           return { registered: true }; // Already registered
         }
       } catch {
@@ -342,7 +342,7 @@ export class CodexInitializer {
 
       // Register the MCP server
       try {
-        execSync('codex mcp add claude-flow -- npx claude-flow mcp start', {
+        execSync('codex mcp add ruflo -- npx ruflo mcp start', {
           stdio: 'pipe',
           timeout: 10000,
         });
@@ -351,13 +351,13 @@ export class CodexInitializer {
         const errorMessage = err instanceof Error ? err.message : String(err);
         return {
           registered: false,
-          warning: `Failed to register MCP server: ${errorMessage}. Run manually: codex mcp add claude-flow -- npx claude-flow mcp start`,
+          warning: `Failed to register MCP server: ${errorMessage}. Run manually: codex mcp add ruflo -- npx ruflo mcp start`,
         };
       }
     } catch {
       return {
         registered: false,
-        warning: 'Could not register MCP server. Run manually: codex mcp add claude-flow -- npx claude-flow mcp start',
+        warning: 'Could not register MCP server. Run manually: codex mcp add ruflo -- npx ruflo mcp start',
       };
     }
   }
@@ -541,7 +541,7 @@ Skills are invoked using \`$skill-name\` syntax. Each skill has:
 
 - Main instructions: \`AGENTS.md\` (project root)
 - Local overrides: \`.codex/AGENTS.override.md\` (gitignored)
-- Claude Flow: https://github.com/ruvnet/claude-flow
+- Ruflo: https://github.com/ruvnet/ruflo
 `;
   }
 
@@ -614,7 +614,7 @@ ${this.skills.map(s => `- \`$${s}\` (Codex) / \`/${s}\` (Claude Code)`).join('\n
 
 \`\`\`bash
 # Start MCP server
-npx @claude-flow/cli mcp start
+npx ruflo mcp start
 \`\`\`
 
 ## Swarm Orchestration

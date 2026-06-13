@@ -237,8 +237,11 @@ describe('@claude-flow/mcp', () => {
 
     it('should initialize a session', () => {
       const session = manager.createSession('stdio');
+      // protocolVersion is a YYYY-MM-DD spec string per the MCP lifecycle
+      // spec — not a {major,minor,patch} object. The earlier object form
+      // was rejected by Claude Code's Zod validator (#1874).
       manager.initializeSession(session.id, {
-        protocolVersion: { major: 2024, minor: 11, patch: 5 },
+        protocolVersion: '2024-11-05',
         capabilities: { tools: { listChanged: true } },
         clientInfo: { name: 'test-client', version: '1.0.0' },
       });

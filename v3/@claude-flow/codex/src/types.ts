@@ -46,6 +46,12 @@ export interface AgentsMdOptions {
 export interface SkillMdOptions {
   name: string;
   description: string;
+  /** Skill version (default: "1.0.0") */
+  version?: string;
+  /** Skill author (default: "rUv") */
+  author?: string;
+  /** Discovery tags (default: derived from the skill name) */
+  tags?: string[];
   triggers?: string[];
   skipWhen?: string[];
   scripts?: SkillScript[];

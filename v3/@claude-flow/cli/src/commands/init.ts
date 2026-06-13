@@ -170,13 +170,52 @@ async function initCodexAction(
   }
 }
 
-// Check if project is already initialized
+// Check if project is already initialized with ruflo.
+// #2207: .claude/settings.json alone is NOT a ruflo marker — it's created by
+// Claude Code itself and exists in every Claude Code project. We require a
+// ruflo-specific signal: either a claudeFlow section in settings.json, OR a
+// .mcp.json with a 'claude-flow' or 'ruflo' server key, OR the ruflo-only
+// .claude-flow/config.yaml. Using the bare file-existence check was causing
+// false-positives for new users whose only existing file was Claude Code's own
+// settings.json.
 function isInitialized(cwd: string): { claude: boolean; claudeFlow: boolean } {
-  const claudePath = path.join(cwd, '.claude', 'settings.json');
   const claudeFlowPath = path.join(cwd, '.claude-flow', 'config.yaml');
+  const mcpJsonPath = path.join(cwd, '.mcp.json');
+  const settingsPath = path.join(cwd, '.claude', 'settings.json');
+
+  // Check .claude-flow/config.yaml — ruflo-specific, always reliable
+  const hasClaudeFlow = fs.existsSync(claudeFlowPath);
+
+  // Check .claude/settings.json for ruflo-specific content (claudeFlow section)
+  let hasRufloSettings = false;
+  if (fs.existsSync(settingsPath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+      hasRufloSettings =
+        parsed != null &&
+        typeof parsed === 'object' &&
+        'claudeFlow' in parsed;
+    } catch { /* malformed — ignore */ }
+  }
+
+  // Check .mcp.json for ruflo/claude-flow server key
+  let hasRufloMcp = false;
+  if (fs.existsSync(mcpJsonPath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(mcpJsonPath, 'utf-8'));
+      hasRufloMcp =
+        parsed != null &&
+        typeof parsed === 'object' &&
+        parsed.mcpServers != null &&
+        typeof parsed.mcpServers === 'object' &&
+        ('claude-flow' in (parsed.mcpServers as Record<string, unknown>) ||
+         'ruflo' in (parsed.mcpServers as Record<string, unknown>));
+    } catch { /* malformed — ignore */ }
+  }
+
   return {
-    claude: fs.existsSync(claudePath),
-    claudeFlow: fs.existsSync(claudeFlowPath),
+    claude: hasRufloSettings || hasRufloMcp,
+    claudeFlow: hasClaudeFlow,
   };
 }
 
@@ -187,6 +226,15 @@ const initAction = async (ctx: CommandContext): Promise<CommandResult> => {
   const full = ctx.flags.full as boolean;
   const skipClaude = ctx.flags['skip-claude'] as boolean;
   const onlyClaude = ctx.flags['only-claude'] as boolean;
+  // #2098A — the parser handles `--no-foo` by stripping the prefix and
+  // storing `flags.foo = false` (parser.ts:291-294), not by storing
+  // `flags['no-foo'] = true`. So `--no-global` lands as
+  // `ctx.flags.global === false`. The old read of `flags['no-global']`
+  // was always undefined and silently no-op'd — every user with the flag
+  // set still got `~/.claude/CLAUDE.md` modified. Read the real key.
+  const noGlobal = ctx.flags['no-global'] === true || ctx.flags['global'] === false;
+  const allAgents = ctx.flags['all-agents'] as boolean;
+  const cloudMcp = ctx.flags['cloud-mcp'] as boolean;
   const codexMode = ctx.flags.codex as boolean;
   const dualMode = ctx.flags.dual as boolean;
   const cwd = ctx.cwd;
@@ -231,6 +279,12 @@ const initAction = async (ctx: CommandContext): Promise<CommandResult> => {
     options = { ...MINIMAL_INIT_OPTIONS, targetDir: cwd, force };
   } else if (full) {
     options = { ...FULL_INIT_OPTIONS, targetDir: cwd, force };
+    // #2356: keep auth-gated cloud MCP servers opt-in even under --full. They
+    // require a login, get committed into .mcp.json, and add per-session MCP
+    // tool-definition token cost. --cloud-mcp restores the all-three behavior.
+    if (!cloudMcp) {
+      options.mcp = { ...options.mcp, ruvSwarm: false, flowNexus: false };
+    }
   } else {
     options = { ...DEFAULT_INIT_OPTIONS, targetDir: cwd, force };
   }
@@ -249,6 +303,20 @@ const initAction = async (ctx: CommandContext): Promise<CommandResult> => {
 
   if (onlyClaude) {
     options.components.runtime = false;
+  }
+
+  // ADR-128 Phase 3 — restore full agent set (98 agents) when user explicitly
+  // requests it. Default is the ~24-agent substrate (core, consensus, swarm,
+  // sparc, testing). Pass --all-agents to get the old behavior.
+  if (allAgents) {
+    options.agents.all = true;
+  }
+
+  // #1744 — opt-out of the user-global ~/.claude/CLAUDE.md "Ruflo Integration"
+  // pointer block. Default behavior (off) preserves current install for users
+  // who rely on it; opting in via --no-global keeps the global file pristine.
+  if (noGlobal) {
+    options.skipGlobalClaudeMd = true;
   }
 
   // Create spinner
@@ -823,7 +891,13 @@ const hooksCommand: Command = {
         skills: false,
         commands: false,
         agents: false,
-        helpers: false,
+        // #2350: helpers MUST ship with the hooks subcommand. The hook entries
+        // in settings.json point at `.claude/helpers/hook-handler.cjs`; if
+        // that file doesn't exist, settings-generator (#1744 fix) drops the
+        // hooks block entirely — so the one subcommand whose stated purpose
+        // is "Initialize only hooks configuration" produced settings.json
+        // with no `hooks` key while reporting "N hooks enabled".
+        helpers: true,
         statusline: false,
         mcp: false,
         runtime: false,
@@ -1052,6 +1126,16 @@ export const initCommand: Command = {
       default: false,
     },
     {
+      // #2356: under --full, the auth-gated cloud MCP servers (ruv-swarm,
+      // flow-nexus) get written into a committed .mcp.json and add MCP
+      // tool-definition token cost every session. Keep them opt-in even with
+      // --full; pass --cloud-mcp to register them.
+      name: 'cloud-mcp',
+      description: 'Register auth-gated cloud MCP servers (ruv-swarm, flow-nexus) in .mcp.json (only relevant with --full)',
+      type: 'boolean',
+      default: false,
+    },
+    {
       name: 'skip-claude',
       description: 'Skip .claude/ directory creation (runtime only)',
       type: 'boolean',
@@ -1060,6 +1144,12 @@ export const initCommand: Command = {
     {
       name: 'only-claude',
       description: 'Only create .claude/ directory (skip runtime)',
+      type: 'boolean',
+      default: false,
+    },
+    {
+      name: 'no-global',
+      description: 'Skip the ~/.claude/CLAUDE.md "Ruflo Integration" pointer block (#1744)',
       type: 'boolean',
       default: false,
     },
@@ -1100,6 +1190,12 @@ export const initCommand: Command = {
       type: 'boolean',
       default: false,
     },
+    {
+      name: 'all-agents',
+      description: 'Install all agent categories (ADR-128: default is ~24 substrate agents; this restores the full set of ~89)',
+      type: 'boolean',
+      default: false,
+    },
   ],
   examples: [
     { command: 'claude-flow init', description: 'Initialize with default configuration' },
@@ -1121,6 +1217,7 @@ export const initCommand: Command = {
     { command: 'claude-flow init --codex', description: 'Initialize for OpenAI Codex (AGENTS.md)' },
     { command: 'claude-flow init --codex --full', description: 'Codex init with all 137+ skills' },
     { command: 'claude-flow init --dual', description: 'Initialize for both Claude Code and Codex' },
+    { command: 'claude-flow init --all-agents', description: 'Install all agent categories (~89 agents; ADR-128 opt-in)' },
   ],
   action: initAction,
 };

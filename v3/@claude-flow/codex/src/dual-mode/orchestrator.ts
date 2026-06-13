@@ -64,7 +64,7 @@ export class DualModeOrchestrator extends EventEmitter {
       sharedNamespace: config.sharedNamespace ?? 'collaboration',
       timeout: config.timeout ?? 300000, // 5 minutes
       claudeCommand: config.claudeCommand ?? 'claude',
-      codexCommand: config.codexCommand ?? 'claude', // Both use claude CLI
+      codexCommand: config.codexCommand ?? 'codex',
     };
   }
 
@@ -77,7 +77,7 @@ export class DualModeOrchestrator extends EventEmitter {
     // Initialize memory database
     await this.runCommand(
       'npx',
-      ['claude-flow@alpha', 'memory', 'init', '--force'],
+      ['ruflo@alpha', 'memory', 'init', '--force'],
       projectPath
     );
 
@@ -85,7 +85,7 @@ export class DualModeOrchestrator extends EventEmitter {
     await this.runCommand(
       'npx',
       [
-        'claude-flow@alpha', 'memory', 'store',
+        'ruflo@alpha', 'memory', 'store',
         '--key', 'task-context',
         '--value', taskContext,
         '--namespace', sharedNamespace
@@ -142,17 +142,25 @@ export class DualModeOrchestrator extends EventEmitter {
     // Build the prompt with memory integration
     const enhancedPrompt = this.buildCollaborativePrompt(config);
 
-    const args = [
-      '-p', enhancedPrompt,
-      '--output-format', 'text',
-    ];
-
-    if (config.maxTurns) {
-      args.push('--max-turns', String(config.maxTurns));
-    }
-
-    if (config.model) {
-      args.push('--model', config.model);
+    // Each platform has its own non-interactive entry point and flag set:
+    //   Claude Code:  claude -p <prompt> --output-format text [--max-turns N] [--model M]
+    //   OpenAI Codex: codex exec --sandbox workspace-write --skip-git-repo-check [-m M] <prompt>
+    // (`codex exec` runs autonomously; PROMPT is a positional arg and must come last.)
+    let args: string[];
+    if (config.platform === 'claude') {
+      args = ['-p', enhancedPrompt, '--output-format', 'text'];
+      if (config.maxTurns) {
+        args.push('--max-turns', String(config.maxTurns));
+      }
+      if (config.model) {
+        args.push('--model', config.model);
+      }
+    } else {
+      args = ['exec', '--sandbox', 'workspace-write', '--skip-git-repo-check'];
+      if (config.model) {
+        args.push('-m', config.model);
+      }
+      args.push(enhancedPrompt);
     }
 
     return new Promise((resolve, reject) => {
@@ -211,9 +219,9 @@ Working Directory: ${projectPath}
 Shared Memory Namespace: ${sharedNamespace}
 
 COLLABORATION PROTOCOL:
-1. Search shared memory for context: npx claude-flow@alpha memory search --query "<relevant terms>" --namespace ${sharedNamespace}
+1. Search shared memory for context: npx ruflo@alpha memory search --query "<relevant terms>" --namespace ${sharedNamespace}
 2. Complete your assigned task
-3. Store your results: npx claude-flow@alpha memory store --key "${config.id}-result" --value "<your summary>" --namespace ${sharedNamespace}
+3. Store your results: npx ruflo@alpha memory store --key "${config.id}-result" --value "<your summary>" --namespace ${sharedNamespace}
 
 YOUR TASK:
 ${config.prompt}
@@ -330,7 +338,7 @@ Remember: Other agents depend on your results in shared memory. Be concise and s
     try {
       const output = await this.runCommand(
         'npx',
-        ['claude-flow@alpha', 'memory', 'list', '--namespace', sharedNamespace, '--format', 'json'],
+        ['ruflo@alpha', 'memory', 'list', '--namespace', sharedNamespace, '--format', 'json'],
         projectPath
       );
       return JSON.parse(output);

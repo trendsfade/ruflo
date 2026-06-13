@@ -157,7 +157,7 @@ function cosineSimilarity(a: number[], b: number[]): number {
 export const embeddingsTools: MCPTool[] = [
   {
     name: 'embeddings_init',
-    description: 'Initialize the ONNX embedding subsystem with hyperbolic support',
+    description: 'Initialize the ONNX embedding subsystem with hyperbolic support Use when text similarity matters beyond keyword match — native Grep finds exact strings, embeddings find meaning. Pair with memory_store / agentdb_pattern-search to land the vector against your knowledge base. For literal symbol search, native Grep is faster.',
     category: 'embeddings',
     inputSchema: {
       type: 'object',
@@ -258,7 +258,7 @@ export const embeddingsTools: MCPTool[] = [
 
   {
     name: 'embeddings_generate',
-    description: 'Generate embeddings for text (Euclidean or hyperbolic)',
+    description: 'Generate embeddings for text (Euclidean or hyperbolic) Use when text similarity matters beyond keyword match — native Grep finds exact strings, embeddings find meaning. Pair with memory_store / agentdb_pattern-search to land the vector against your knowledge base. For literal symbol search, native Grep is faster.',
     category: 'embeddings',
     inputSchema: {
       type: 'object',
@@ -326,7 +326,7 @@ export const embeddingsTools: MCPTool[] = [
 
   {
     name: 'embeddings_compare',
-    description: 'Compare similarity between two texts',
+    description: 'Compare similarity between two texts Use when text similarity matters beyond keyword match — native Grep finds exact strings, embeddings find meaning. Pair with memory_store / agentdb_pattern-search to land the vector against your knowledge base. For literal symbol search, native Grep is faster.',
     category: 'embeddings',
     inputSchema: {
       type: 'object',
@@ -416,7 +416,7 @@ export const embeddingsTools: MCPTool[] = [
 
   {
     name: 'embeddings_search',
-    description: 'Semantic search across stored embeddings',
+    description: 'Semantic search across stored embeddings Use when text similarity matters beyond keyword match — native Grep finds exact strings, embeddings find meaning. Pair with memory_store / agentdb_pattern-search to land the vector against your knowledge base. For literal symbol search, native Grep is faster.',
     category: 'embeddings',
     inputSchema: {
       type: 'object',
@@ -518,7 +518,7 @@ export const embeddingsTools: MCPTool[] = [
 
   {
     name: 'embeddings_neural',
-    description: 'Neural substrate operations (RuVector integration)',
+    description: 'Neural substrate operations (RuVector integration) Use when text similarity matters beyond keyword match — native Grep finds exact strings, embeddings find meaning. Pair with memory_store / agentdb_pattern-search to land the vector against your knowledge base. For literal symbol search, native Grep is faster.',
     category: 'embeddings',
     inputSchema: {
       type: 'object',
@@ -715,7 +715,7 @@ export const embeddingsTools: MCPTool[] = [
 
   {
     name: 'embeddings_hyperbolic',
-    description: 'Hyperbolic embedding operations (Poincaré ball)',
+    description: 'Hyperbolic embedding operations (Poincaré ball) Use when text similarity matters beyond keyword match — native Grep finds exact strings, embeddings find meaning. Pair with memory_store / agentdb_pattern-search to land the vector against your knowledge base. For literal symbol search, native Grep is faster.',
     category: 'embeddings',
     inputSchema: {
       type: 'object',
@@ -833,7 +833,7 @@ export const embeddingsTools: MCPTool[] = [
 
   {
     name: 'embeddings_status',
-    description: 'Get embeddings system status and configuration',
+    description: 'Get embeddings system status and configuration Use when text similarity matters beyond keyword match — native Grep finds exact strings, embeddings find meaning. Pair with memory_store / agentdb_pattern-search to land the vector against your knowledge base. For literal symbol search, native Grep is faster.',
     category: 'embeddings',
     inputSchema: {
       type: 'object',
@@ -849,6 +849,24 @@ export const embeddingsTools: MCPTool[] = [
         };
       }
 
+      // ADR-093 F5: distinguish "@ruvector/core installed" from "wired into
+      // the embedding pipeline". Previously this collapsed both into a
+      // single `ruvector: boolean` field, which gave callers no way to
+      // tell whether re-running embeddings_init would help (#1698 partial
+      // regression on the MCP boundary).
+      let ruvectorAvailable = false;
+      let ruvectorVersion: string | undefined;
+      try {
+        const mod = await import('@ruvector/core');
+        ruvectorAvailable = !!(mod as Record<string, unknown>);
+        try {
+          // Best-effort: many packages expose a `version` constant
+          ruvectorVersion = (mod as { version?: string }).version;
+        } catch { /* ignore */ }
+      } catch { /* not installed */ }
+
+      const ruvectorEnabled = config.neural.ruvector?.enabled ?? false;
+
       return {
         success: true,
         initialized: true,
@@ -859,7 +877,16 @@ export const embeddingsTools: MCPTool[] = [
           hyperbolic: config.hyperbolic,
           neural: {
             enabled: config.neural.enabled,
-            ruvector: config.neural.ruvector?.enabled ?? false,
+            // Backwards-compatible: keep the boolean view (truthy when wired).
+            ruvector: ruvectorEnabled,
+            // New shape — additive, non-breaking. Callers that need to
+            // distinguish "package is installed" from "feature wired in"
+            // read these instead of guessing from a single bool.
+            ruvectorStatus: {
+              available: ruvectorAvailable,
+              enabled: ruvectorEnabled,
+              version: ruvectorVersion,
+            },
           },
         },
         paths: {
@@ -881,7 +908,7 @@ export const embeddingsTools: MCPTool[] = [
 
   {
     name: 'embeddings_rabitq_build',
-    description: 'Build RaBitQ 1-bit quantized index from stored embeddings (32× compression). Pre-filters candidates via Hamming scan before exact rerank.',
+    description: 'Build RaBitQ 1-bit quantized index from stored embeddings (32× compression). Pre-filters candidates via Hamming scan before exact rerank. Use when text similarity matters beyond keyword match — native Grep finds exact strings, embeddings find meaning. Pair with memory_store / agentdb_pattern-search to land the vector against your knowledge base. For literal symbol search, native Grep is faster.',
     category: 'embeddings',
     inputSchema: {
       type: 'object',
@@ -897,7 +924,7 @@ export const embeddingsTools: MCPTool[] = [
 
   {
     name: 'embeddings_rabitq_search',
-    description: 'Search via RaBitQ quantized index (fast Hamming scan). Returns candidate IDs for reranking.',
+    description: 'Search via RaBitQ quantized index (fast Hamming scan). Returns candidate IDs for reranking. Use when text similarity matters beyond keyword match — native Grep finds exact strings, embeddings find meaning. Pair with memory_store / agentdb_pattern-search to land the vector against your knowledge base. For literal symbol search, native Grep is faster.',
     category: 'embeddings',
     inputSchema: {
       type: 'object',
@@ -941,7 +968,7 @@ export const embeddingsTools: MCPTool[] = [
 
   {
     name: 'embeddings_rabitq_status',
-    description: 'Get RaBitQ quantized index status — availability, vector count, compression ratio',
+    description: 'Get RaBitQ quantized index status — availability, vector count, compression ratio Use when text similarity matters beyond keyword match — native Grep finds exact strings, embeddings find meaning. Pair with memory_store / agentdb_pattern-search to land the vector against your knowledge base. For literal symbol search, native Grep is faster.',
     category: 'embeddings',
     inputSchema: {
       type: 'object',

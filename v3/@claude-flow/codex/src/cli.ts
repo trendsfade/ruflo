@@ -692,6 +692,10 @@ program
 import { createDualModeCommand } from './dual-mode/index.js';
 program.addCommand(createDualModeCommand());
 
+// Codex /loop-compatible runner
+import { createLoopCommand } from './loop/cli.js';
+program.addCommand(createLoopCommand());
+
 // Error handling for unknown commands
 program.on('command:*', () => {
   console.error(chalk.red(`Invalid command: ${program.args.join(' ')}`));

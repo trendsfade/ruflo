@@ -6,6 +6,14 @@
 import type { InitOptions } from './types.js';
 import { generateStatuslineScript, generateStatuslineHook } from './statusline-generator.js';
 
+// ADR-127 Phase 4 — attribution is opt-in (#1670 / #2089).
+// When the user passes --attribution (options.attribution === true),
+// this footer is available for injection into generated content such as
+// PR body templates and release notes.  It is NEVER hard-wired into the
+// static command-file templates — those are user-owned content.
+export const ATTRIBUTION_FOOTER =
+  '🤖 Generated with [RuFlo](https://github.com/ruvnet/ruflo)';
+
 /**
  * Generate pre-commit hook script
  */
@@ -203,7 +211,16 @@ export function generateAgentRouter(): string {
   return `#!/usr/bin/env node
 /**
  * Ruflo Agent Router
- * Routes tasks to optimal agents based on learned patterns
+ *
+ * Static keyword router that suggests an agent for a task description.
+ * NOTE: This is *not* a learned model. It is a heuristic table; "confidence"
+ * is reported as a heuristic prior, not a calibrated probability.
+ *
+ * #2257 fix: patterns are now word-boundary-anchored so short tokens like
+ * \`cd\`, \`ci\`, \`ui\`, \`add\`, \`structure\` no longer match inside unrelated
+ * words (\`decision\`, \`infrastructure\`, \`address\`, \`addendum\`). Default
+ * matched-confidence dropped from 0.8 to 0.6, and fall-through from 0.5 to
+ * 0.3, to reflect that this is a static heuristic, not a learned classifier.
  */
 
 const AGENT_CAPABILITIES = {
@@ -217,40 +234,54 @@ const AGENT_CAPABILITIES = {
   devops: ['ci-cd', 'docker', 'deployment', 'infrastructure'],
 };
 
-const TASK_PATTERNS = {
-  // Code patterns
-  'implement|create|build|add|write code': 'coder',
-  'test|spec|coverage|unit test|integration': 'tester',
-  'review|audit|check|validate|security': 'reviewer',
-  'research|find|search|documentation|explore': 'researcher',
-  'design|architect|structure|plan': 'architect',
+// Each entry has a token list. Single tokens get \\b…\\b boundaries so 'cd'
+// won't match inside 'decide'. Phrases (whitespace or '/') match literally —
+// the whitespace acts as a natural boundary.
+const TASK_PATTERNS = [
+  { tokens: ['implement', 'create', 'build', 'add', 'write code', 'refactor', 'debug'], agent: 'coder' },
+  { tokens: ['test', 'tests', 'spec', 'coverage', 'unit test', 'integration test'], agent: 'tester' },
+  { tokens: ['review', 'audit', 'check', 'validate', 'security'], agent: 'reviewer' },
+  { tokens: ['research', 'find', 'search', 'documentation', 'explore'], agent: 'researcher' },
+  { tokens: ['design', 'architect', 'architecture', 'structure', 'plan'], agent: 'architect' },
+  { tokens: ['api', 'endpoint', 'server', 'backend', 'database'], agent: 'backend-dev' },
+  { tokens: ['ui', 'frontend', 'component', 'react', 'css', 'style'], agent: 'frontend-dev' },
+  { tokens: ['deploy', 'docker', 'ci', 'cd', 'ci/cd', 'pipeline', 'infrastructure', 'devops'], agent: 'devops' },
+];
 
-  // Domain patterns
-  'api|endpoint|server|backend|database': 'backend-dev',
-  'ui|frontend|component|react|css|style': 'frontend-dev',
-  'deploy|docker|ci|cd|pipeline|infrastructure': 'devops',
-};
+function escapeRegex(s) {
+  return s.replace(/[.*+?^\${}()|[\\]\\\\]/g, '\\\\$&');
+}
+
+function buildPattern(tokens) {
+  const alternatives = tokens.map((tok) => {
+    const escaped = escapeRegex(tok.toLowerCase());
+    if (/\\s|\\//.test(tok)) return escaped;
+    return \`\\\\b\${escaped}\\\\b\`;
+  });
+  return new RegExp(\`(?:\${alternatives.join('|')})\`, 'i');
+}
+
+const COMPILED_PATTERNS = TASK_PATTERNS.map((entry) => ({
+  agent: entry.agent,
+  tokens: entry.tokens,
+  regex: buildPattern(entry.tokens),
+}));
 
 function routeTask(task) {
-  const taskLower = task.toLowerCase();
-
-  // Check patterns
-  for (const [pattern, agent] of Object.entries(TASK_PATTERNS)) {
-    const regex = new RegExp(pattern, 'i');
-    if (regex.test(taskLower)) {
+  const taskLower = String(task == null ? '' : task).toLowerCase();
+  for (const entry of COMPILED_PATTERNS) {
+    if (entry.regex.test(taskLower)) {
       return {
-        agent,
-        confidence: 0.8,
-        reason: \`Matched pattern: \${pattern}\`,
+        agent: entry.agent,
+        confidence: 0.6,
+        reason: \`Matched keyword(s) from: \${entry.tokens.join('|')}\`,
       };
     }
   }
-
-  // Default to coder for unknown tasks
   return {
     agent: 'coder',
-    confidence: 0.5,
-    reason: 'Default routing - no specific pattern matched',
+    confidence: 0.3,
+    reason: 'Default routing - no specific keyword matched',
   };
 }
 
@@ -265,7 +296,7 @@ if (task) {
   console.log('\\nAvailable agents:', Object.keys(AGENT_CAPABILITIES).join(', '));
 }
 
-module.exports = { routeTask, AGENT_CAPABILITIES, TASK_PATTERNS };
+module.exports = { routeTask, AGENT_CAPABILITIES, TASK_PATTERNS, buildPattern };
 `;
 }
 
@@ -432,8 +463,12 @@ export function generateHookHandler(): string {
     '  if (stdinData.trim()) {',
     '    try { hookInput = JSON.parse(stdinData); } catch (e) { /* ignore */ }',
     '  }',
-    '  // Prefer stdin fields, then env, then argv',
-    "  var prompt = hookInput.prompt || hookInput.command || hookInput.toolInput || process.env.PROMPT || process.env.TOOL_INPUT_command || args.join(' ') || '';",
+    '  // Prefer stdin fields, then env, then argv. `hookInput.toolInput` is an',
+    '  // object (e.g. {command:"ls"}); falling back to it directly bound prompt',
+    '  // to the object and tripped .toLowerCase() / .substring() on every Bash',
+    '  // hook (#1944). Pull `.command` off whichever stdin shape Claude Code sent.',
+    '  var toolInputObj = hookInput.toolInput || hookInput.tool_input || {};',
+    "  var prompt = hookInput.prompt || hookInput.command || toolInputObj.command || process.env.PROMPT || process.env.TOOL_INPUT_command || args.join(' ') || '';",
     '',
     'const handlers = {',
     "  'route': () => {",
@@ -1188,6 +1223,14 @@ export function generateHelpers(options: InitOptions): Record<string, string> {
     // Windows-specific scripts
     helpers['daemon-manager.ps1'] = generateWindowsDaemonManager();
     helpers['daemon-manager.cmd'] = generateWindowsBatchWrapper();
+
+    // ADR-127 Phase 4 — expose the attribution footer as a helper file only
+    // when the user explicitly opts in. The file content is the single-line
+    // string so init-generated PR templates can `cat .claude/helpers/attribution`
+    // and append it conditionally without hard-wiring the string everywhere.
+    if (options.attribution === true) {
+      helpers['attribution'] = ATTRIBUTION_FOOTER + '\n';
+    }
   }
 
   if (options.components.statusline) {
@@ -1197,3 +1240,76 @@ export function generateHelpers(options: InitOptions): Record<string, string> {
 
   return helpers;
 }
+
+/**
+ * Generate cross-platform Node.js port of ruflo-hook.sh (#2132).
+ *
+ * The bash shim works on Mac/Linux but fails on native Windows (exit 126).
+ * This .cjs version is always deployed to .claude/helpers/ so:
+ *   - Windows: settings.json overrides plugin bash hooks with node-based cmds
+ *   - Mac/Linux: plugin hooks.json still uses .sh (faster, battle-tested)
+ *   - Both: .claude/helpers/ruflo-hook.cjs available as a canonical cross-platform shim
+ */
+export function generateRufloHookCjs(): string {
+  return `#!/usr/bin/env node
+/**
+ * ruflo-hook.cjs — cross-platform Node.js port of ruflo-hook.sh (#2132)
+ *
+ * Deployed to .claude/helpers/ during ruflo init. On Windows, the
+ * generated .claude/settings.json hooks point here instead of the
+ * plugin's bash-only ruflo-hook.sh.
+ *
+ * Always exits 0 — hook subcommands are best-effort telemetry and must
+ * never block a Claude Code turn.
+ */
+
+'use strict';
+
+const { spawnSync, execSync } = require('child_process');
+const fs = require('fs');
+
+function done() { process.exit(0); }
+
+function commandExists(cmd) {
+  try {
+    const r = execSync(
+      process.platform === 'win32' ? 'where ' + cmd : 'command -v ' + cmd,
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+    );
+    return r.trim().length > 0;
+  } catch { return false; }
+}
+
+function invokeHook(bin, binArgs, hookArgs, stdinData) {
+  const args = [...binArgs, ...hookArgs];
+  const result = spawnSync(bin, args, {
+    shell: process.platform === 'win32',
+    input: stdinData || '',
+    encoding: 'utf8',
+    stdio: ['pipe', 'ignore', 'ignore'],
+    timeout: 30_000,
+  });
+  return result.status === 0;
+}
+
+function main() {
+  const args = process.argv.slice(2);
+  if (args.length === 0) done();
+
+  const [subcommand, ...rest] = args;
+
+  let stdinData = '';
+  try { stdinData = fs.readFileSync(0, 'utf8'); } catch { stdinData = ''; }
+
+  const hookArgs = ['hooks', subcommand, ...rest];
+
+  if (commandExists('ruflo')) { invokeHook('ruflo', [], hookArgs, stdinData); done(); }
+  if (commandExists('claude-flow')) { invokeHook('claude-flow', [], hookArgs, stdinData); done(); }
+  invokeHook('npx', ['--prefer-offline', '--yes', 'ruflo@latest'], hookArgs, stdinData);
+  done();
+}
+
+main();
+`;
+}
+

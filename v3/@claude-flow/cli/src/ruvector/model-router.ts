@@ -1,20 +1,33 @@
 /**
- * Intelligent Model Router using Tiny Dancer
+ * Intelligent Model Router — lexical complexity heuristic + Thompson bandit
  *
- * Dynamically routes requests to optimal Claude model (haiku/sonnet/opus)
- * based on task complexity, confidence scores, and historical performance.
+ * Dynamically routes requests to the optimal Claude model (haiku/sonnet/opus)
+ * based on task complexity, uncertainty, and online-learned routing outcomes.
  *
- * Features:
- * - FastGRNN-based routing decisions (<100μs)
- * - Uncertainty quantification for model escalation
- * - Circuit breaker for failover
- * - Online learning from routing outcomes
- * - Complexity scoring via embeddings
+ * Mechanism (shipped):
+ * - Complexity score = blend of lexical, semantic-depth, task-scope, and
+ *   uncertainty heuristics (see `computeLexicalComplexity` and friends).
+ *   Pure JS arithmetic — no model load, no tensor math.
+ * - Model selection = Thompson-sampling Beta-Bernoulli bandit with
+ *   complexity-bucketed Beta(α,β) priors, persisted to
+ *   `.swarm/model-router-state.json` and updated by `recordOutcome` after
+ *   each routing decision.
+ * - Uncertainty quantification + a circuit breaker drive escalation when
+ *   the bandit's confidence is low or downstream failures are observed.
  *
  * Routing Strategy:
- * - Haiku: High confidence, low complexity (fast, cheap)
- * - Sonnet: Medium confidence, moderate complexity (balanced)
- * - Opus: Low confidence, high complexity (most capable)
+ * - Haiku: high confidence, low complexity (fast, cheap)
+ * - Sonnet: medium confidence, moderate complexity (balanced)
+ * - Opus: low confidence, high complexity (most capable)
+ *
+ * Note (#2329): An earlier design (ADR-026 + this file's previous header)
+ * described a Tiny-Dancer / FastGRNN neural router with embedding-based
+ * complexity scoring. That path was never wired in — `@ruvector/tiny-dancer`
+ * is not imported here and the `embedding`-consuming branch in
+ * `computeSemanticDepth` is only reachable via the externally-callable
+ * `routeToModelFull(task, embedding)` wrapper (no internal callers). The
+ * shipped router is the heuristic + bandit described above; the neural
+ * path remains a future direction tracked in #2329.
  *
  * @module model-router
  */
@@ -151,8 +164,49 @@ export interface ComplexityAnalysis {
 }
 
 /**
+ * Beta(α, β) prior for Thompson sampling. Each model carries one of these;
+ * outcomes update α (successes) and β (failures) so the router auto-balances
+ * cost/quality without manual threshold tuning. See ADR-101.
+ */
+export interface BetaPrior {
+  alpha: number;
+  beta: number;
+}
+
+/**
+ * Cost-adjusted Bernoulli rewards for Thompson sampling updates. Higher
+ * reward when the right tier is chosen — Haiku-success > Sonnet-success >
+ * Opus-success because Opus-success on a simple task is wasteful even when
+ * the answer is correct. Escalations get partial credit at best (Sonnet) or
+ * zero (Haiku/Opus) since they signal the initial choice was wrong.
+ */
+const BANDIT_REWARDS: Record<ClaudeModel, Record<'success' | 'failure' | 'escalated', number>> = {
+  haiku:   { success: 1.0, failure: 0.0, escalated: 0.0 },
+  sonnet:  { success: 0.7, failure: 0.0, escalated: 0.1 },
+  opus:    { success: 0.4, failure: 0.0, escalated: 0.0 },
+  inherit: { success: 0.5, failure: 0.0, escalated: 0.0 },
+};
+
+/**
  * Router state for persistence
  */
+/**
+ * Complexity bucket for per-task bandit priors. Bands mirror
+ * MODEL_CAPABILITIES.maxComplexity (haiku 0.4, sonnet 0.7) so the taxonomy
+ * isn't arbitrary. Keying priors by bucket fixes the global-bandit defect where
+ * failures on one task type suppressed a model for ALL task types (audit
+ * docs/reviews/intelligence-system-audit-2026-05-29.md; see ADR-142).
+ */
+export type ComplexityBucket = 'low' | 'med' | 'high';
+
+function complexityBucket(score: number): ComplexityBucket {
+  if (score < 0.4) return 'low';   // haiku territory
+  if (score < 0.7) return 'med';   // sonnet territory
+  return 'high';                    // opus territory
+}
+
+type BucketedPriors = Record<ComplexityBucket, Record<ClaudeModel, BetaPrior>>;
+
 interface RouterState {
   totalDecisions: number;
   modelDistribution: Record<ClaudeModel, number>;
@@ -167,15 +221,137 @@ interface RouterState {
     outcome: 'success' | 'failure' | 'escalated';
     timestamp: string;
   }>;
+  /** Persisted-schema version. v2 = per-bucket priors (ADR-142). */
+  version?: number;
+  /**
+   * Beta(α, β) priors per complexity bucket per model — populated by
+   * recordOutcome via Thompson sampling. Defaults to {alpha:1,beta:1}
+   * (uniform). Keyed by bucket so e.g. haiku failures on hard tasks don't
+   * suppress haiku for easy tasks. Old flat per-model files migrate forward
+   * (see migratePriors).
+   */
+  priors?: BucketedPriors;
+}
+
+// ============================================================================
+// Beta Sampling for Thompson Sampling Bandit
+// ============================================================================
+
+/**
+ * Standard normal sample via Box-Muller. Used by Marsaglia-Tsang Gamma.
+ * Module-local so the bandit doesn't pull in a heavy stats dep.
+ */
+function sampleStandardNormal(): number {
+  const u1 = Math.random() || 1e-12; // avoid log(0)
+  const u2 = Math.random();
+  return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+}
+
+/**
+ * Sample from Gamma(shape α, scale=1). Marsaglia & Tsang (2000), with the
+ * standard "boost α<1 by α+1 then scale by U^(1/α)" trick for shape parameters
+ * smaller than 1. O(1) expected, no rejection-loop pathology in practice.
+ */
+function sampleGamma(alpha: number): number {
+  if (alpha < 1) {
+    const u = Math.random() || 1e-12;
+    return sampleGamma(alpha + 1) * Math.pow(u, 1 / alpha);
+  }
+  const d = alpha - 1 / 3;
+  const c = 1 / Math.sqrt(9 * d);
+  while (true) {
+    let x: number;
+    let v: number;
+    do {
+      x = sampleStandardNormal();
+      v = 1 + c * x;
+    } while (v <= 0);
+    v = v * v * v;
+    const u = Math.random();
+    const xx = x * x;
+    if (u < 1 - 0.0331 * xx * xx) return d * v;
+    if (Math.log(u) < 0.5 * xx + d * (1 - v + Math.log(v))) return d * v;
+  }
+}
+
+/**
+ * Sample θ ~ Beta(α, β) via the identity Beta(α,β) = X / (X+Y) where
+ * X ~ Gamma(α), Y ~ Gamma(β). Returns the mean for degenerate α+β=0
+ * (shouldn't happen in practice but defensive).
+ */
+function sampleBeta(alpha: number, beta: number): number {
+  if (alpha <= 0 || beta <= 0) return 0.5;
+  const x = sampleGamma(alpha);
+  const y = sampleGamma(beta);
+  const denom = x + y;
+  return denom > 0 ? x / denom : 0.5;
+}
+
+/**
+ * Default uniform priors (no prior knowledge). Beta(1,1) is the standard
+ * Bayesian-Bernoulli starting point — uniform over [0,1].
+ */
+function defaultBanditPriors(): Record<ClaudeModel, BetaPrior> {
+  return {
+    haiku:   { alpha: 1, beta: 1 },
+    sonnet:  { alpha: 1, beta: 1 },
+    opus:    { alpha: 1, beta: 1 },
+    inherit: { alpha: 1, beta: 1 },
+  };
+}
+
+/** Uniform priors for every complexity bucket (cold start). */
+function defaultBucketedPriors(): BucketedPriors {
+  return { low: defaultBanditPriors(), med: defaultBanditPriors(), high: defaultBanditPriors() };
+}
+
+function clonePriors(p: Record<ClaudeModel, BetaPrior>): Record<ClaudeModel, BetaPrior> {
+  return { haiku: { ...p.haiku }, sonnet: { ...p.sonnet }, opus: { ...p.opus }, inherit: { ...p.inherit } };
+}
+
+/**
+ * Forward-migrate a persisted `priors` field of any layout to the bucketed
+ * shape, never throwing (ADR-142):
+ *  - missing/garbage → fresh uniform buckets
+ *  - already bucketed (has `low.haiku`) → kept, backfilling any missing bucket
+ *  - flat per-model (v1 bandit) → seed ALL buckets from it (lossless: prior
+ *    learning becomes a shared starting point that then diverges per bucket)
+ */
+function migratePriors(p: unknown): BucketedPriors {
+  if (!p || typeof p !== 'object') return defaultBucketedPriors();
+  const obj = p as Record<string, any>;
+  if (obj.low && typeof obj.low === 'object' && obj.low.haiku) {
+    return {
+      low: obj.low,
+      med: obj.med ?? clonePriors(obj.low),
+      high: obj.high ?? clonePriors(obj.low),
+    };
+  }
+  if (obj.haiku && typeof obj.haiku.alpha === 'number') {
+    const flat = obj as Record<ClaudeModel, BetaPrior>;
+    return { low: clonePriors(flat), med: clonePriors(flat), high: clonePriors(flat) };
+  }
+  return defaultBucketedPriors();
 }
 
 // ============================================================================
 // Default Configuration
 // ============================================================================
 
+// #2250 — env override for maxUncertainty so callers can suppress the
+// escalation without recompiling. Parsed once at module load; invalid /
+// out-of-range values fall through to the default below.
+function envMaxUncertainty(): number | undefined {
+  const raw = process.env.CLAUDE_FLOW_MAX_UNCERTAINTY;
+  if (!raw) return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0 || n > 1) return undefined;
+  return n;
+}
+
 const DEFAULT_CONFIG: ModelRouterConfig = {
   confidenceThreshold: 0.85,
-  maxUncertainty: 0.15,
+  maxUncertainty: envMaxUncertainty() ?? 0.15,
   enableCircuitBreaker: true,
   circuitBreakerThreshold: 5,
   statePath: '.swarm/model-router-state.json',
@@ -183,6 +359,12 @@ const DEFAULT_CONFIG: ModelRouterConfig = {
   enableCostOptimization: true,
   preferSpeed: true,
 };
+
+// Posterior mean of a Beta(α,β) prior — used by the #2250 escalation guard
+// to detect when the bandit has *learned* the escalation target is worse.
+function priorMean(p: { alpha: number; beta: number }): number {
+  return p.alpha / (p.alpha + p.beta);
+}
 
 // ============================================================================
 // Model Router Implementation
@@ -405,19 +587,36 @@ export class ModelRouter {
   }
 
   /**
-   * Select the best model from scores
+   * Select the best model from scores. Uses Thompson sampling (#1772):
+   * each model's deterministic complexity score is multiplied by a draw
+   * θ_m ~ Beta(α_m, β_m) from its bandit prior. Models with strong empirical
+   * track records get sampled higher; models with poor outcomes get sampled
+   * lower; the system auto-corrects against tier overuse without manual
+   * threshold tuning. Beta(1,1) = uniform on cold start so behavior matches
+   * the prior deterministic router until outcomes accumulate.
    */
   private selectModel(
     scores: Record<ClaudeModel, number>,
     complexityScore: number
   ): { model: ClaudeModel; confidence: number; uncertainty: number } {
-    // Get sorted models by score
-    const sorted = (Object.entries(scores) as [ClaudeModel, number][])
+    // Thompson sampling: combine deterministic score with bandit posterior,
+    // keyed by complexity bucket (ADR-142) so learning is task-type-local.
+    const bucketed = this.state.priors ?? defaultBucketedPriors();
+    const priors = bucketed[complexityBucket(complexityScore)] ?? defaultBanditPriors();
+    const sampledScores: Record<ClaudeModel, number> = {
+      haiku:   scores.haiku   * sampleBeta(priors.haiku.alpha,   priors.haiku.beta),
+      sonnet:  scores.sonnet  * sampleBeta(priors.sonnet.alpha,  priors.sonnet.beta),
+      opus:    scores.opus    * sampleBeta(priors.opus.alpha,    priors.opus.beta),
+      inherit: scores.inherit, // not bandit-controlled
+    };
+
+    // Get sorted models by sampled score (drops 'inherit' from selection)
+    const sorted = (Object.entries(sampledScores) as [ClaudeModel, number][])
       .filter(([m]) => m !== 'inherit')
       .sort((a, b) => b[1] - a[1]);
 
     const [bestModel, bestScore] = sorted[0];
-    const [secondModel, secondScore] = sorted[1] || ['sonnet', 0];
+    const [, secondScore] = sorted[1] || ['sonnet' as ClaudeModel, 0];
 
     // Confidence is how much better the best is vs second
     const confidence = bestScore > 0 ? Math.min(1, bestScore / (bestScore + secondScore + 0.01)) : 0.5;
@@ -426,11 +625,38 @@ export class ModelRouter {
     const scoreSpread = bestScore - secondScore;
     const uncertainty = Math.max(0, 1 - scoreSpread - confidence * 0.5);
 
-    // Escalate if uncertainty is too high
+    // Escalate if uncertainty is too high.
+    //
+    // #2250 — `uncertainty` here is structurally ~0.6-0.7 for low-complexity
+    // tasks (formula: `1 - scoreSpread - confidence*0.5`, where `scoreSpread`
+    // is a raw 0-1 difference between bandit-sampled scores that rarely
+    // exceeds 0.1). With `maxUncertainty = 0.15` the gate fires on
+    // ~every trivial route, promoting `sonnet→opus` and `haiku→sonnet`
+    // even when the Thompson sampler has *already* suppressed the higher
+    // tier (e.g. opus `Beta(3.8, 17.2)`, mean ≈ 0.18). The learned
+    // suppression is computed and then discarded one line later.
+    //
+    // Guard: skip the escalation when EITHER (a) the bandit has confidently
+    // learned the escalation target performs WORSE than the selected model,
+    // OR (b) the bandit has a confident, decent posterior on the selected
+    // model — i.e. the Thompson sampler picked this tier on real evidence,
+    // not a coin flip. Cold-start priors (Beta(1,1), α+β=2, mean=0.5) fail
+    // both checks, so unlearned routers still escalate as before.
     let model = bestModel;
     if (uncertainty > this.config.maxUncertainty && bestModel !== 'opus') {
-      // Escalate to more capable model
-      model = bestModel === 'haiku' ? 'sonnet' : 'opus';
+      const escalateTo: ClaudeModel = bestModel === 'haiku' ? 'sonnet' : 'opus';
+      const selectedMean = priorMean(priors[bestModel]);
+      const targetMean = priorMean(priors[escalateTo]);
+      const targetWorse = targetMean < selectedMean - 0.10;
+      // Treat the selected model as trusted once the bandit has accumulated
+      // ~5 effective observations AND its mean is at least 0.45 (neutral-or-
+      // better). Both thresholds chosen to keep cold-start behavior identical
+      // while honoring any non-trivial learning.
+      const selectedSamples = priors[bestModel].alpha + priors[bestModel].beta;
+      const selectedTrusted = selectedSamples >= 5 && selectedMean >= 0.45;
+      if (!targetWorse && !selectedTrusted) {
+        model = escalateTo;
+      }
     }
 
     return { model, confidence, uncertainty };
@@ -499,11 +725,17 @@ export class ModelRouter {
       this.consecutiveFailures[model] = 0;
     }
 
-    // Track in history
+    // Re-derive this task's complexity bucket from the task string (the MCP
+    // outcome payload carries no complexity), using the SAME analyzeComplexity
+    // path route() uses so record-time and select-time buckets match.
+    const taskScore = this.analyzeComplexity(task).score;
+    const bucket = complexityBucket(taskScore);
+
+    // Track in history (record THIS task's score, not the running average)
     this.state.learningHistory.push({
       task: task.slice(0, 100),
       model,
-      complexity: this.state.avgComplexity,
+      complexity: taskScore,
       outcome,
       timestamp: new Date().toISOString(),
     });
@@ -516,6 +748,15 @@ export class ModelRouter {
     if (outcome === 'failure') {
       this.state.circuitBreakerTrips++;
     }
+
+    // Thompson sampling update (#1772): cost-adjusted Bernoulli reward.
+    // Haiku-success > Sonnet-success > Opus-success (Opus on simple tasks
+    // is wasteful even when correct). Failure/escalation always β++.
+    if (!this.state.priors) this.state.priors = defaultBucketedPriors();
+    const bp = this.state.priors[bucket] ?? (this.state.priors[bucket] = defaultBanditPriors());
+    const reward = BANDIT_REWARDS[model]?.[outcome] ?? 0.5;
+    bp[model].alpha += reward;
+    bp[model].beta += 1 - reward;
 
     this.saveState();
   }
@@ -553,13 +794,20 @@ export class ModelRouter {
       circuitBreakerTrips: 0,
       lastUpdated: new Date().toISOString(),
       learningHistory: [],
+      version: 2,
+      priors: defaultBucketedPriors(),
     };
 
     try {
       const fullPath = join(process.cwd(), this.config.statePath);
       if (existsSync(fullPath)) {
         const data = readFileSync(fullPath, 'utf-8');
-        return { ...defaultState, ...JSON.parse(data) };
+        const loaded = JSON.parse(data) as Partial<RouterState> & { priors?: unknown };
+        // ADR-142: forward-migrate priors of ANY layout (missing / flat v1 /
+        // already-bucketed) to the bucketed shape without data loss or throwing.
+        loaded.priors = migratePriors(loaded.priors);
+        loaded.version = 2;
+        return { ...defaultState, ...(loaded as Partial<RouterState>) };
       }
     } catch {
       // Ignore load errors
@@ -597,10 +845,38 @@ export class ModelRouter {
       circuitBreakerTrips: 0,
       lastUpdated: new Date().toISOString(),
       learningHistory: [],
+      version: 2,
+      priors: defaultBucketedPriors(),
     };
     this.consecutiveFailures = { haiku: 0, sonnet: 0, opus: 0, inherit: 0 };
     this.decisionCount = 0;
     this.saveState();
+  }
+
+  /**
+   * Public read-only accessor for the bandit priors. Useful for tests,
+   * dashboards, and the pending hooks_intelligence_stats integration that
+   * surfaces convergence in the dashboard. Returns a copy.
+   */
+  getBanditPriors(bucket: ComplexityBucket = 'med'): Record<ClaudeModel, BetaPrior> {
+    const bucketed = this.state.priors ?? defaultBucketedPriors();
+    const p = bucketed[bucket] ?? defaultBanditPriors();
+    return {
+      haiku:   { ...p.haiku },
+      sonnet:  { ...p.sonnet },
+      opus:    { ...p.opus },
+      inherit: { ...p.inherit },
+    };
+  }
+
+  /** All bucketed priors (copy) — for dashboards/tests. */
+  getBucketedPriors(): BucketedPriors {
+    const b = this.state.priors ?? defaultBucketedPriors();
+    return {
+      low: clonePriors(b.low ?? defaultBanditPriors()),
+      med: clonePriors(b.med ?? defaultBanditPriors()),
+      high: clonePriors(b.high ?? defaultBanditPriors()),
+    };
   }
 }
 

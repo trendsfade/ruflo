@@ -18,6 +18,9 @@
     "lstm",
     "napi",
     "mcp",
-    "swarm"
+    "swarm",
+    "neural-trader-runtime",
+    "walk-forward",
+    "monte-carlo"
   ]
 }

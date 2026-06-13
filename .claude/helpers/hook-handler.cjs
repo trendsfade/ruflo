@@ -100,7 +100,10 @@ async function main() {
   var toolInput = hookInput.toolInput || hookInput.tool_input || {};
   var toolName = hookInput.toolName || hookInput.tool_name || '';
 
-  var prompt = hookInput.prompt || hookInput.command || toolInput
+  // `toolInput` is an object (e.g. {command:"ls"}) — falling back to it
+  // directly bound `prompt` to the object and tripped `.toLowerCase()` /
+  // `.substring()` on every Bash hook (#1944). Use the `.command` field.
+  var prompt = hookInput.prompt || hookInput.command || toolInput.command
     || process.env.PROMPT || process.env.TOOL_INPUT_command || '';
 
 const handlers = {
@@ -128,7 +131,10 @@ const handlers = {
   },
 
   'pre-bash': () => {
-    var cmd = (hookInput.command || prompt).toLowerCase();
+    // String() wrap is belt-and-suspenders for #2017: even if a future regression
+    // re-binds `prompt` or `hookInput.command` to a non-string, `.toLowerCase()`
+    // can no longer throw a TypeError that the global try/catch would swallow.
+    var cmd = String(hookInput.command || toolInput.command || prompt || '').toLowerCase();
     var dangerous = ['rm -rf /', 'format c:', 'del /s /q c:\\', ':(){:|:&};:'];
     for (var i = 0; i < dangerous.length; i++) {
       if (cmd.includes(dangerous[i])) {

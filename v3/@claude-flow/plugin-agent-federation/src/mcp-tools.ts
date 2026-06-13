@@ -2,9 +2,12 @@ import type { MCPToolDefinition } from '@claude-flow/shared/src/plugin-interface
 import type { PluginContext } from '@claude-flow/shared/src/plugin-interface.js';
 import type { FederationCoordinator } from './application/federation-coordinator.js';
 import type { FederationMessageType } from './domain/entities/federation-envelope.js';
+import type { WgMeshService } from './domain/services/wg-mesh-service.js';
+import { generateWgKeyPair } from './domain/value-objects/wg-config.js';
 
 type CoordinatorGetter = () => FederationCoordinator | null;
 type ContextGetter = () => PluginContext | null;
+type WgMeshGetter = () => WgMeshService | null;
 
 function textResult(text: string, isError = false) {
   return { content: [{ type: 'text' as const, text }], isError };
@@ -13,11 +16,17 @@ function textResult(text: string, isError = false) {
 export function createMcpTools(
   getCoordinator: CoordinatorGetter,
   getContext: ContextGetter,
+  getWgMesh: WgMeshGetter = () => null,
 ): MCPToolDefinition[] {
   function requireCoordinator(): FederationCoordinator {
     const c = getCoordinator();
     if (!c) throw new Error('Federation not initialized');
     return c;
+  }
+  function requireWgMesh(): WgMeshService {
+    const w = getWgMesh();
+    if (!w) throw new Error('WG mesh layer not initialized (set config.wgMesh = true and inject WgMeshService)');
+    return w;
   }
 
   return [
@@ -89,7 +98,7 @@ export function createMcpTools(
     },
     {
       name: 'federation_send',
-      description: 'Send a message to a federated peer through the PII pipeline and security gates',
+      description: 'Send a message to a federated peer through the PII pipeline and security gates. Optional budget controls (ADR-097): maxHops defaults to 8 to prevent recursive delegation; maxTokens/maxUsd cap cumulative spend across the hop chain.',
       pluginName: '@claude-flow/plugin-agent-federation',
       version: '1.0.0-alpha.1',
       inputSchema: {
@@ -98,6 +107,33 @@ export function createMcpTools(
           targetNodeId: { type: 'string', description: 'Target node ID' },
           messageType: { type: 'string', description: 'Message type (task-assignment, memory-query, context-share, etc.)' },
           payload: { type: 'object', description: 'Message payload' },
+          // ADR-097 Phase 1: optional budget envelope. Backward compatible —
+          // omitting these preserves the legacy unbounded-tokens/USD path,
+          // with maxHops still defaulting to 8 to defang recursion loops.
+          budget: {
+            type: 'object',
+            description: 'Optional cumulative spend budget for this delegation chain',
+            properties: {
+              maxTokens: { type: 'number', description: 'Hard cap on Σ tokens across hops' },
+              maxUsd: { type: 'number', description: 'Hard cap on Σ USD spent' },
+            },
+          },
+          maxHops: {
+            type: 'number',
+            description: 'Maximum hops this message may travel (default 8, 0 disallows remote delegation)',
+          },
+          hopCount: {
+            type: 'number',
+            description: 'How many hops this message has already taken (0 on the originator)',
+          },
+          spent: {
+            type: 'object',
+            description: 'Caller-reported usage from previous legs (cumulative)',
+            properties: {
+              tokens: { type: 'number' },
+              usd: { type: 'number' },
+            },
+          },
         },
         required: ['targetNodeId', 'messageType', 'payload'],
       },
@@ -107,6 +143,12 @@ export function createMcpTools(
           params['targetNodeId'] as string,
           params['messageType'] as FederationMessageType,
           params['payload'],
+          {
+            budget: params['budget'] as { maxTokens?: number; maxUsd?: number } | undefined,
+            maxHops: params['maxHops'] as number | undefined,
+            hopCount: params['hopCount'] as number | undefined,
+            spent: params['spent'] as { tokens?: number; usd?: number } | undefined,
+          },
         );
         return textResult(JSON.stringify(result, null, 2), !result.success);
       },
@@ -202,6 +244,107 @@ export function createMcpTools(
       },
     },
     {
+      name: 'federation_breaker_status',
+      description: 'ADR-097 Phase 4: per-peer circuit-breaker state snapshot. Returns each known peer with its lifecycle state (ACTIVE/SUSPENDED/EVICTED), when it changed, and why. Combine with federation_evict / federation_reactivate to operate the breaker manually.',
+      pluginName: '@claude-flow/plugin-agent-federation',
+      version: '1.0.0-alpha.1',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          nodeId: { type: 'string', description: 'Optional: filter to a single peer' },
+        },
+      },
+      handler: async (params) => {
+        const coordinator = requireCoordinator();
+        const states = coordinator.getPeerStates();
+        const filter = params['nodeId'] as string | undefined;
+        const filtered = filter ? states.filter((s) => s.nodeId === filter) : states;
+        const counts = coordinator.getPeerStateCounts();
+        return textResult(JSON.stringify({ counts, peers: filtered }, null, 2));
+      },
+    },
+    {
+      name: 'federation_evict',
+      description: 'ADR-097 Phase 4: operator-initiated evict for a peer. Marks the peer EVICTED so subsequent federation_send calls short-circuit with PEER_EVICTED. Reversible only via federation_reactivate (operator override).',
+      pluginName: '@claude-flow/plugin-agent-federation',
+      version: '1.0.0-alpha.1',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          nodeId: { type: 'string', description: 'Target peer to evict' },
+          correlationId: { type: 'string', description: 'Optional audit-trail correlation key (operator ticket, etc.)' },
+        },
+        required: ['nodeId'],
+      },
+      handler: async (params) => {
+        const coordinator = requireCoordinator();
+        const ok = await coordinator.evictPeer(
+          params['nodeId'] as string,
+          'MANUAL_EVICT',
+          params['correlationId'] as string | undefined,
+        );
+        const msg = ok
+          ? `Evicted peer ${params['nodeId']}`
+          : `No transition (peer unknown or already EVICTED): ${params['nodeId']}`;
+        return textResult(msg, !ok);
+      },
+    },
+    {
+      name: 'federation_reactivate',
+      description: 'ADR-097 Phase 4: operator-initiated reactivate for a SUSPENDED or EVICTED peer. Used after a health probe confirms recovery, or as an operator override on a manual evict. The breaker does NOT auto-reactivate; this MCP tool is the explicit lever.',
+      pluginName: '@claude-flow/plugin-agent-federation',
+      version: '1.0.0-alpha.1',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          nodeId: { type: 'string', description: 'Target peer to reactivate' },
+          correlationId: { type: 'string', description: 'Optional audit-trail correlation key (probe ID, ticket, etc.)' },
+        },
+        required: ['nodeId'],
+      },
+      handler: async (params) => {
+        const coordinator = requireCoordinator();
+        const ok = await coordinator.reactivatePeer(
+          params['nodeId'] as string,
+          params['correlationId'] as string | undefined,
+        );
+        const msg = ok
+          ? `Reactivated peer ${params['nodeId']}`
+          : `No transition (peer unknown or already ACTIVE): ${params['nodeId']}`;
+        return textResult(msg, !ok);
+      },
+    },
+    {
+      name: 'federation_report_spend',
+      description: 'ADR-097 Phase 3 upstream: report the actual cost of a completed federated call. Fans out to the cost-tracker bus (via the integrator-wired SpendReporter) and the breaker service (so its in-memory rolling buffer is fed). Both targets are optional; calling without either configured is a silent no-op.',
+      pluginName: '@claude-flow/plugin-agent-federation',
+      version: '1.0.0-alpha.1',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          peerId: { type: 'string', description: 'Peer this cost was incurred against' },
+          taskId: { type: 'string', description: 'Optional task correlation key' },
+          tokensUsed: { type: 'number', description: 'Tokens consumed (input + output)' },
+          usdSpent: { type: 'number', description: 'USD spent' },
+          success: { type: 'boolean', description: 'Whether the underlying send succeeded (drives breaker failure-ratio)' },
+          ts: { type: 'string', description: 'ISO 8601 timestamp; auto-filled if omitted' },
+        },
+        required: ['peerId', 'tokensUsed', 'usdSpent', 'success'],
+      },
+      handler: async (params) => {
+        const coordinator = requireCoordinator();
+        await coordinator.reportSpend({
+          peerId: params['peerId'] as string,
+          taskId: params['taskId'] as string | undefined,
+          tokensUsed: params['tokensUsed'] as number,
+          usdSpent: params['usdSpent'] as number,
+          success: params['success'] as boolean,
+          ts: params['ts'] as string | undefined,
+        });
+        return textResult('Spend reported');
+      },
+    },
+    {
       name: 'federation_consensus',
       description: 'Propose a federated consensus operation across all active peers',
       pluginName: '@claude-flow/plugin-agent-federation',
@@ -231,6 +374,92 @@ export function createMcpTools(
           messageType: proposal.messageType,
           quorumRequired: proposal.quorumRequired,
           expiresAt: proposal.expiresAt.toISOString(),
+        }, null, 2));
+      },
+    },
+    {
+      name: 'federation_wg_status',
+      description: 'ADR-111 Phase 6: WG mesh state — per-peer trust level, mesh IP, suspended/evicted flags, and the AllowedIPs slice each peer currently has. Use to inspect what the breaker has propagated to the L3 layer.',
+      pluginName: '@claude-flow/plugin-agent-federation',
+      version: '1.0.0-alpha.1',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          nodeId: { type: 'string', description: 'Optional: filter to a single peer' },
+        },
+      },
+      handler: async (params) => {
+        const wg = requireWgMesh();
+        const coordinator = requireCoordinator();
+        const peers = coordinator.listPeers();
+        const summary = wg.summarize(peers);
+        const filter = params['nodeId'] as string | undefined;
+        const filtered = filter ? summary.filter(s => s.nodeId === filter) : summary;
+        return textResult(JSON.stringify({
+          interfaceName: wg.getInterfaceName(),
+          meshSubnet: wg.getMeshSubnet(),
+          peers: filtered,
+        }, null, 2));
+      },
+    },
+    {
+      name: 'federation_wg_attest',
+      description: 'ADR-111 Phase 6 (witness chain): emit an operator-signed attestation entry for a coordination change. Returns the canonical bytes the operator signs + the witness entry; operator appends it to .claude-flow/federation/wg-changes.log. Idempotent — re-attesting the same change just appends another entry.',
+      pluginName: '@claude-flow/plugin-agent-federation',
+      version: '1.0.0-alpha.1',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          eventType: { type: 'string', description: 'peer-added | peer-removed-suspended | peer-restored | peer-evicted | key-rotated | interface-config-applied' },
+          peerPublicKey: { type: 'string', description: 'Optional: peer pubkey (omit for interface-level events)' },
+          meshIP: { type: 'string', description: 'Optional: peer mesh IP' },
+          wgCommand: { type: 'string', description: 'Optional: wg command that was emitted' },
+          rationale: { type: 'string', description: 'Human-readable rationale for the audit log' },
+        },
+        required: ['eventType', 'rationale'],
+      },
+      handler: async () => {
+        // Phase 6 v1 stub — the WgWitnessService is the canonical signer. This
+        // MCP tool returns instructions until plugin.ts wires the service.
+        // Tracked alongside #1879 follow-up: integrate WgWitnessService into
+        // plugin lifecycle so this handler can call attestWgCommand directly.
+        return textResult(
+          'federation_wg_attest: wire WgWitnessService in plugin.ts (Phase 6 follow-up). Until then, use the WgWitnessService class directly from the federation package.',
+          true,
+        );
+      },
+    },
+    {
+      name: 'federation_wg_keyrotate',
+      description: 'ADR-111 Phase 6: rotate the local WG keypair. Returns the new public key + recommended next steps (republish manifest, peers regenerate their wg-quick config, grace-period destruction of old key). DESTRUCTIVE — the old private key is overwritten on disk; existing tunnels are dropped until peers update.',
+      pluginName: '@claude-flow/plugin-agent-federation',
+      version: '1.0.0-alpha.1',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          confirm: { type: 'boolean', description: 'Must be true. Destructive: drops existing tunnels until all peers update their config.' },
+        },
+        required: ['confirm'],
+      },
+      handler: async (params) => {
+        if (params['confirm'] !== true) {
+          return textResult('Refusing rotate: confirm must be true. This drops existing tunnels until peers fetch the new manifest.', true);
+        }
+        // Phase 6 v1: emits a fresh keypair + the upgrade checklist. plugin.ts
+        // is responsible for the actual disk write + manifest republish; this
+        // returns the new public key for the operator to coordinate.
+        const newKey = generateWgKeyPair();
+        return textResult(JSON.stringify({
+          publicKey: newKey.publicKey,
+          createdAt: newKey.createdAt,
+          nextSteps: [
+            'Write the new private key to .claude-flow/federation/wg-key-<nodeId>.json (mode 0600)',
+            'Republish federation manifest with the new wg.publicKey',
+            'Peers regenerate their wg-quick config from the updated manifest',
+            'Operator removes the old [Peer] block from /etc/wireguard/<iface>.conf after the grace period (default 1h)',
+            'Run federation_wg_attest with eventType=key-rotated',
+          ],
+          warning: 'Private key NOT returned via MCP. The operator wires the actual disk persistence.',
         }, null, 2));
       },
     },

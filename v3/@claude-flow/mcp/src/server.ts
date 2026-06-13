@@ -87,12 +87,9 @@ export class MCPServer extends EventEmitter implements IMCPServer {
     version: '3.0.0',
   };
 
-  // MCP 2025-11-25 protocol version
-  private readonly protocolVersion: MCPProtocolVersion = {
-    major: 2025,
-    minor: 11,
-    patch: 25,
-  };
+  // MCP protocol version — spec-required YYYY-MM-DD date string (#1874).
+  // Claude Code's Zod validator rejects any other shape.
+  private readonly protocolVersion: MCPProtocolVersion = '2025-11-25';
 
   // Full MCP 2025-11-25 capabilities
   private capabilities: MCPCapabilities = {

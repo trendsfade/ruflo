@@ -157,7 +157,8 @@ hive-mind-prompt-*.txt
 .claude-flow/data/
 .claude-flow/logs/
 
-# Environment variables
+# Environment variables — block ALL .env variants except .example templates
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+!.env.*.example

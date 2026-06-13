@@ -136,3 +136,10 @@ Use learned patterns to predict phase durations and common blockers:
 - `mcp__claude-flow__hooks_intelligence_trajectory-start` / `trajectory-step` / `trajectory-end` — record execution trajectories
 - `mcp__claude-flow__neural_predict` / `neural_train` — predict and learn from SPARC cycles
 - `mcp__claude-flow__workflow_create` / `workflow_execute` — automate repeatable phase workflows
+
+### Neural Learning
+
+After each phase or full SPARC cycle, feed the phase-quality learning loop so quality gates self-tune:
+```bash
+npx @claude-flow/cli@latest hooks post-task --task-id "TASK_ID" --success true --train-neural true
+```

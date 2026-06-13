@@ -550,14 +550,14 @@ const indexCommand: Command = {
   description: 'Manage HNSW indexes',
   options: [
     { name: 'action', short: 'a', type: 'string', description: 'Action: build, rebuild, status, optimize', default: 'status' },
-    { name: 'collection', short: 'c', type: 'string', description: 'Collection/namespace name' },
+    { name: 'collection', short: 'c', type: 'string', description: 'Collection/namespace label (informational; HNSW is a single global index across all namespaces). Omit to build for all namespaces (#1947 RC2).' },
     { name: 'ef-construction', type: 'number', description: 'HNSW ef_construction parameter', default: '200' },
     { name: 'm', type: 'number', description: 'HNSW M parameter', default: '16' },
   ],
   examples: [
     { command: 'claude-flow embeddings index', description: 'Show index status' },
-    { command: 'claude-flow embeddings index -a build -c documents', description: 'Build index' },
-    { command: 'claude-flow embeddings index -a optimize -c patterns', description: 'Optimize index' },
+    { command: 'claude-flow embeddings index -a build', description: 'Build index from all namespaces' },
+    { command: 'claude-flow embeddings index -a rebuild -c project', description: 'Rebuild (label as `project`)' },
   ],
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     const action = ctx.flags.action as string || 'status';
@@ -571,6 +571,15 @@ const indexCommand: Command = {
 
     try {
       const { getHNSWStatus, getHNSWIndex, searchHNSWIndex, generateEmbedding } = await import('../memory/memory-initializer.js');
+
+      // Trigger lazy initialization before reading status, otherwise the
+      // singleton stays null and produces a misleading "@ruvector/core not
+      // available" warning even when the package is present (#1698).
+      await getHNSWIndex().catch(() => null);
+
+      // Probe whether @ruvector/core is loadable so we can distinguish
+      // "package missing" from "package present but index empty".
+      const ruvectorAvailable = await import('@ruvector/core').then(() => true).catch(() => false);
 
       // Get real HNSW status
       const status = getHNSWStatus();
@@ -615,10 +624,15 @@ const indexCommand: Command = {
             `  Speedup: ~${Math.round(speedup)}x`,
             `  Results: ${results?.length || 0} matches`,
           ].join('\n'), 'Search Performance');
-        } else if (!status.available) {
+        } else if (!status.available && !ruvectorAvailable) {
           output.writeln();
           output.printWarning('@ruvector/core not available');
           output.printInfo('Install: npm install @ruvector/core');
+        } else if (!status.available) {
+          output.writeln();
+          output.printWarning('HNSW index not initialized (but @ruvector/core is installed)');
+          output.printInfo('This usually means no embeddings have been stored yet.');
+          output.printInfo('Run: claude-flow memory store -k "key" --value "text"');
         } else {
           output.writeln();
           output.printInfo('Index is empty. Store some entries to populate it.');
@@ -630,12 +644,16 @@ const indexCommand: Command = {
 
       // Build/Rebuild action
       if (action === 'build' || action === 'rebuild') {
-        if (!collection) {
-          output.printError('Collection is required for build/rebuild');
-          return { success: false, exitCode: 1 };
-        }
+        // #1947 RC #2: `-c` is informational — the HNSW index is global
+        // and indexes every namespace's embeddings in one structure. The
+        // earlier code REQUIRED `-c` for build/rebuild AND its examples
+        // suggested `-c default`, which silently produced 0 vectors when a
+        // user's entries lived under a different namespace (e.g. `project`,
+        // `claude-memories`). Treat omitted `-c` as "all namespaces"
+        // (the actual runtime behavior) and tell the user as much.
+        const label = collection ?? '(all namespaces)';
 
-        const spinner = output.createSpinner({ text: `${action}ing index for ${collection}...`, spinner: 'dots' });
+        const spinner = output.createSpinner({ text: `${action}ing index for ${label}...`, spinner: 'dots' });
         spinner.start();
 
         // Force rebuild if requested
@@ -652,13 +670,19 @@ const indexCommand: Command = {
         const newStatus = getHNSWStatus();
         output.writeln();
         output.printBox([
-          `Collection: ${collection}`,
+          `Collection: ${label}`,
           `Action: ${action}`,
           `Vectors: ${newStatus.entryCount}`,
           `Dimensions: ${newStatus.dimensions}`,
           `M: ${m}`,
           `ef_construction: ${efConstruction}`,
         ].join('\n'), 'Index Built');
+
+        if (!collection && newStatus.entryCount === 0) {
+          output.writeln();
+          output.printInfo('No vectors indexed. Store some entries first:');
+          output.printInfo('  claude-flow memory store -k "key" --value "text" --namespace <ns>');
+        }
 
         return { success: true, data: newStatus };
       }
@@ -684,7 +708,7 @@ const initCommand: Command = {
   name: 'init',
   description: 'Initialize embedding subsystem with ONNX model and hyperbolic config',
   options: [
-    { name: 'model', short: 'm', type: 'string', description: 'ONNX model ID', default: 'Xenova/all-MiniLM-L6-v2' },
+    { name: 'model', short: 'm', type: 'string', description: 'ONNX model ID', default: 'all-MiniLM-L6-v2' },
     { name: 'hyperbolic', type: 'boolean', description: 'Enable hyperbolic (Poincaré ball) embeddings', default: 'true' },
     { name: 'curvature', short: 'c', type: 'string', description: 'Poincaré ball curvature (use --curvature=-1 for negative)', default: '-1' },
     { name: 'download', short: 'd', type: 'boolean', description: 'Download model during init', default: 'true' },
@@ -693,13 +717,13 @@ const initCommand: Command = {
   ],
   examples: [
     { command: 'claude-flow embeddings init', description: 'Initialize with defaults' },
-    { command: 'claude-flow embeddings init --model Xenova/all-mpnet-base-v2', description: 'Use higher quality model' },
+    { command: 'claude-flow embeddings init --model all-mpnet-base-v2', description: 'Use higher quality model' },
     { command: 'claude-flow embeddings init --no-hyperbolic', description: 'Euclidean only' },
     { command: 'claude-flow embeddings init --curvature=-0.5', description: 'Custom curvature (use = for negative)' },
     { command: 'claude-flow embeddings init --force', description: 'Overwrite existing config' },
   ],
   action: async (ctx: CommandContext): Promise<CommandResult> => {
-    const model = ctx.flags.model as string || 'Xenova/all-MiniLM-L6-v2';
+    const model = ctx.flags.model as string || 'all-MiniLM-L6-v2';
     const hyperbolic = ctx.flags.hyperbolic !== false;
     const download = ctx.flags.download !== false;
     const force = ctx.flags.force === true;

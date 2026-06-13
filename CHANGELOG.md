@@ -5,6 +5,14 @@ All notable changes to the Ruflo project (formerly Claude Flow) are documented h
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Configurable statusline cost segment via two environment variables (defaults unchanged):
+  - `RUFLO_STATUSLINE_COST_SYMBOL` — override the leading `$` (e.g. `⚡`, `€`, `🌱`); empty string shows the number alone.
+  - `RUFLO_STATUSLINE_HIDE_COST` — `1`/`true`/`yes`/`on` hides the segment. `cost.total_cost_usd` is a client-side estimate that may differ from the actual bill and is misleading on subscription plans.
+
 ## [3.5.0] - 2026-02-27
 
 ### Ruflo v3.5 — First Major Stable Release

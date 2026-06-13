@@ -80,3 +80,10 @@ Use MCP tools for persistence and learning:
 - `mcp__claude-flow__hooks_intelligence_trajectory-start` / `trajectory-step` / `trajectory-end` — record execution trajectories for learning
 - `mcp__claude-flow__neural_predict` — predict optimal approaches based on learned patterns
 - `mcp__claude-flow__workflow_create` / `workflow_execute` — codify repeatable plans as workflows
+
+### Neural Learning
+
+After completing a plan, feed the planner trajectory store so future replans inherit the outcome:
+```bash
+npx @claude-flow/cli@latest hooks post-task --task-id "TASK_ID" --success true --train-neural true
+```

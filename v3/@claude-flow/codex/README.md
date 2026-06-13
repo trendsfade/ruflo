@@ -7,7 +7,8 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@claude-flow/codex"><img src="https://img.shields.io/npm/v/@claude-flow/codex?label=npm&color=blue" alt="npm version"></a>
-  <a href="https://github.com/ruvnet/claude-flow"><img src="https://img.shields.io/badge/license-MIT-green" alt="license"></a>
+  <a href="https://www.npmjs.com/package/@claude-flow/codex"><img src="https://img.shields.io/npm/dm/@claude-flow/codex?label=downloads&color=cb3837" alt="npm downloads"></a>
+  <a href="https://github.com/ruvnet/ruflo"><img src="https://img.shields.io/badge/license-MIT-green" alt="license"></a>
   <a href="https://agentics.org"><img src="https://img.shields.io/badge/standard-Agentics-purple" alt="Agentics Standard"></a>
 </p>
 
@@ -653,6 +654,25 @@ npx claude-flow-codex dual run --template refactor --task "src/legacy/"
 npx claude-flow-codex dual status
 ```
 
+### Codex Loop Runner
+
+Codex does not expose Claude Code's `ScheduleWakeup`, so `@claude-flow/codex` provides a process-based equivalent:
+
+```bash
+# Run Codex repeatedly until it creates .codex/loop/default.complete or reaches 10 iterations
+npx claude-flow-codex loop run "Fix failing tests and create the completion marker when done"
+
+# Use command mode for recurring Ruflo workers or custom scripts
+npx claude-flow-codex loop run --name testgaps --interval 270 --max-iterations 0 \
+  --command "npx claude-flow hooks worker dispatch --trigger testgaps"
+
+# Inspect or stop a loop from another terminal
+npx claude-flow-codex loop status --name testgaps
+npx claude-flow-codex loop stop --name testgaps
+```
+
+Loop state is stored in `.codex/loop/<name>.json`; `loop stop` writes `.codex/loop/<name>.stop`, which the runner observes between iterations.
+
 ### Pre-Built Templates
 
 | Template | Pipeline | Platforms |
@@ -1020,5 +1040,5 @@ MIT
 
 ## Support
 
-- Documentation: https://github.com/ruvnet/claude-flow
-- Issues: https://github.com/ruvnet/claude-flow/issues
+- Documentation: https://github.com/ruvnet/ruflo
+- Issues: https://github.com/ruvnet/ruflo/issues

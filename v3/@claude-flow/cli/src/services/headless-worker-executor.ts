@@ -629,27 +629,49 @@ export class HeadlessWorkerExecutor extends EventEmitter {
   // ============================================
 
   /**
-   * Check if Claude Code CLI is available
+   * Check if Claude Code CLI is available.
+   *
+   * #2110 fix — three issues addressed:
+   *   1. Cache only `true`, never `false`. A transient failure (WSL2 cold
+   *      start, AV scanner, slow shell init) used to set
+   *      `claudeCodeAvailable = false` for the rest of the daemon
+   *      lifetime, so the daemon kept running local stubs even after the
+   *      user fixed `claude auth login`. Now: false results re-probe on
+   *      the next call.
+   *   2. Log the actual error from the catch block instead of silently
+   *      swallowing it. Operators couldn't distinguish timeout / ENOENT /
+   *      auth-failure / exit-code without this.
+   *   3. Honour `CLAUDE_CODE_AVAILABILITY_TIMEOUT_MS` for WSL2 / slow
+   *      systems where `claude --version` can take >5s on first invoke.
    */
   async isAvailable(): Promise<boolean> {
-    if (this.claudeCodeAvailable !== null) {
-      return this.claudeCodeAvailable;
+    // Only the `true` result is cached — `false` is re-probed every call
+    // so a transient failure doesn't poison the rest of the daemon's life.
+    if (this.claudeCodeAvailable === true) {
+      return true;
     }
 
+    const timeoutMs = Number.parseInt(process.env.CLAUDE_CODE_AVAILABILITY_TIMEOUT_MS || '', 10) || 5000;
     try {
       const output = execSync('claude --version', {
         encoding: 'utf-8',
         stdio: 'pipe',
-        timeout: 5000,
+        timeout: timeoutMs,
         windowsHide: true, // Prevent phantom console windows on Windows
       });
       this.claudeCodeAvailable = true;
       this.claudeCodeVersion = output.trim();
       this.emit('status', { available: true, version: this.claudeCodeVersion });
       return true;
-    } catch {
-      this.claudeCodeAvailable = false;
-      this.emit('status', { available: false });
+    } catch (err) {
+      // Don't cache false — let the next call retry. Surface the actual
+      // error via emit so operators can diagnose timeout / ENOENT / auth.
+      this.claudeCodeAvailable = null;
+      const reason =
+        err instanceof Error
+          ? `${err.name}: ${err.message}`.slice(0, 200)
+          : String(err).slice(0, 200);
+      this.emit('status', { available: false, reason });
       return false;
     }
   }
@@ -711,6 +733,20 @@ export class HeadlessWorkerExecutor extends EventEmitter {
   /**
    * Get pool status
    */
+  /**
+   * #1855: return the PIDs of all currently-running headless worker
+   * children. Used by `WorkerDaemon` to snapshot active child PIDs to
+   * disk so the next lifetime can reap orphans after a hard crash.
+   */
+  getActiveChildPids(): number[] {
+    const out: number[] = [];
+    for (const entry of this.processPool.values()) {
+      const pid = entry.process?.pid;
+      if (typeof pid === 'number' && pid > 0) out.push(pid);
+    }
+    return out;
+  }
+
   getPoolStatus(): PoolStatus {
     const now = Date.now();
     return {
@@ -1142,22 +1178,58 @@ Analyze the above codebase context and provide your response following the forma
       // Resolve model: user env override > config override > default alias
       env.ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || MODEL_IDS[options.model];
 
-      // Spawn claude CLI process
-      const child = spawn('claude', ['--print', prompt], {
+      // Spawn claude CLI process. #1852: previously the prompt was passed
+      // as a positional CLI arg. On Windows `claude` resolves to
+      // `claude.cmd`, which Node refuses to exec directly (CVE-2024-27980
+      // mitigation) — it routes through `cmd.exe /d /s /c`, which then
+      // re-tokenizes the entire command line including the prompt.
+      // Source-code prompts contain `>` `<` `&` `|` (arrow functions,
+      // comparisons, redirections) — cmd.exe parses those as redirects
+      // and creates zero-byte files in cwd named after the next token
+      // (`controller.abort()`, `{const`, `0`, `HTTP`, etc.).
+      //
+      // Fix: pipe the prompt via stdin instead. `child.stdin.end(prompt)`
+      // writes the prompt and closes stdin atomically — the EOF still
+      // unblocks `claude --print` (the original concern in #1395) but no
+      // shell tokenization touches the prompt.
+      // #2098B / #2093 — `claude --print` can spawn grandchildren (MCP
+      // server stdio bridges, plugin tools). When the head times out a
+      // plain `child.kill()` only signals the head; grandchildren get
+      // reparented to init and survive — the symptom @maxstefanakis1114
+      // diagnosed as a 5-second redispatch + subprocess-table growth.
+      // `detached: true` puts the child in its own process group so we
+      // can signal the whole tree with `process.kill(-pid, sig)`.
+      const child = spawn('claude', ['--print'], {
         cwd: this.projectRoot,
         env,
-        stdio: ['ignore', 'pipe', 'pipe'], // 'ignore' closes stdin at spawn — fixes #1395 where claude --print blocks on EOF
+        stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true, // Prevent phantom console windows on Windows
+        detached: process.platform !== 'win32',
       });
+      try {
+        child.stdin?.end(prompt);
+      } catch {
+        // stdin already closed (e.g. spawn failed) — `error` handler below
+        // will surface the real cause.
+      }
+
+      // Kill the whole process group on POSIX, fall back to the child on
+      // Windows (where setsid-style detach isn't available the same way).
+      const killTree = (signal: NodeJS.Signals) => {
+        if (process.platform !== 'win32' && typeof child.pid === 'number') {
+          try { process.kill(-child.pid, signal); return; } catch { /* fall through */ }
+        }
+        try { child.kill(signal); } catch { /* already dead */ }
+      };
 
       // Setup timeout
       const timeoutHandle = setTimeout(() => {
         if (this.processPool.has(options.executionId)) {
-          child.kill('SIGTERM');
+          killTree('SIGTERM');
           // Give it a moment to terminate gracefully
           setTimeout(() => {
             if (!child.killed) {
-              child.kill('SIGKILL');
+              killTree('SIGKILL');
             }
           }, 5000);
         }
@@ -1232,7 +1304,7 @@ Analyze the above codebase context and provide your response following the forma
         if (!this.processPool.has(options.executionId)) return;
 
         resolved = true;
-        child.kill('SIGTERM');
+        killTree('SIGTERM');
         cleanup();
 
         resolve({

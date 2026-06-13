@@ -15,6 +15,15 @@ const BACKENDS = [
   { value: 'hybrid', label: 'Hybrid', hint: 'SQLite + AgentDB (recommended)' },
   { value: 'memory', label: 'In-Memory', hint: 'Fast but non-persistent' }
 ];
+// #2105: shared --path option for memory subcommands.
+// Precedence: --path > CLAUDE_FLOW_DB_PATH env var > default root
+const DB_PATH_OPTION = {
+  name: 'path',
+  description:
+    'Override DB file path (also: CLAUDE_FLOW_DB_PATH env var). ' +
+    'Precedence: --path > CLAUDE_FLOW_DB_PATH > CLAUDE_FLOW_MEMORY_PATH/memory.db > cwd/.swarm/memory.db',
+  type: 'string' as const,
+};
 
 // Store command
 const storeCommand: Command = {
@@ -63,7 +72,8 @@ const storeCommand: Command = {
       description: 'Update if key exists (insert or replace)',
       type: 'boolean',
       default: false
-    }
+    },
+    DB_PATH_OPTION
   ],
   examples: [
     { command: 'claude-flow memory store -k "api/auth" -v "JWT implementation"', description: 'Store text' },
@@ -111,7 +121,8 @@ const storeCommand: Command = {
 
     // Use direct sql.js storage with automatic embedding generation
     try {
-      const { storeEntry } = await import('../memory/memory-initializer.js');
+      const { storeEntry, resolveDbPath: _rdbStore } = await import('../memory/memory-initializer.js');
+      const dbPath = _rdbStore(ctx.flags.path as string | undefined);
 
       if (asVector) {
         output.writeln(output.dim('  Generating embedding vector...'));
@@ -124,7 +135,8 @@ const storeCommand: Command = {
         generateEmbeddingFlag: true, // Always generate embeddings for semantic search
         tags,
         ttl,
-        upsert
+        upsert,
+        dbPath
       });
 
       if (!result.success) {
@@ -178,7 +190,21 @@ const retrieveCommand: Command = {
       description: 'Memory namespace',
       type: 'string',
       default: 'default'
-    }
+    },
+    // #2073: --format is the GLOBAL option (parser.ts:78) with choices
+    // ['text', 'json', 'table'] and default 'text'. The retrieve handler
+    // discriminates: 'json' emits parseable JSON, anything else (text/box/...)
+    // emits the human-readable box. No per-command override needed; we just
+    // document the behavior in the help text via examples.
+    {
+      // #2073: --value-only emits ONLY the value string (no wrapper).
+      // Designed for piping into JSON.parse without any cleanup.
+      name: 'value-only',
+      description: 'Print only the stored value to stdout (no wrapper)',
+      type: 'boolean',
+      default: false
+    },
+    DB_PATH_OPTION
   ],
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     const key = ctx.flags.key as string || ctx.args[0];
@@ -191,8 +217,9 @@ const retrieveCommand: Command = {
 
     // Use sql.js directly for consistent data access
     try {
-      const { getEntry } = await import('../memory/memory-initializer.js');
-      const result = await getEntry({ key, namespace });
+      const { getEntry, resolveDbPath: _rdbRetrieve } = await import('../memory/memory-initializer.js');
+      const dbPathRetrieve = _rdbRetrieve(ctx.flags.path as string | undefined);
+      const result = await getEntry({ key, namespace, dbPath: dbPathRetrieve });
 
       if (!result.success) {
         output.printError(`Failed to retrieve: ${result.error}`);
@@ -205,6 +232,17 @@ const retrieveCommand: Command = {
       }
 
       const entry = result.entry;
+
+      // #2073: --value-only emits just the raw value (no decoration) for
+      // piping into JSON.parse / jq / other downstream parsers without
+      // any cleanup.
+      if (ctx.flags['value-only'] || ctx.flags.valueOnly) {
+        // Use process.stdout.write directly to bypass any printer-side
+        // transformation of quotes/structural characters.
+        process.stdout.write(entry.content);
+        if (process.stdout.isTTY) process.stdout.write('\n');
+        return { success: true, data: entry };
+      }
 
       if (ctx.flags.format === 'json') {
         output.printJson(entry);
@@ -286,7 +324,8 @@ const searchCommand: Command = {
       description: 'Use SmartRetrieval pipeline (query expansion, RRF, MMR, recency)',
       type: 'boolean',
       default: false
-    }
+    },
+    DB_PATH_OPTION
   ],
   examples: [
     { command: 'claude-flow memory search -q "authentication patterns"', description: 'Semantic search' },
@@ -338,7 +377,8 @@ const searchCommand: Command = {
 
     // Use direct sql.js search with vector similarity
     try {
-      const { searchEntries } = await import('../memory/memory-initializer.js');
+      const { searchEntries, resolveDbPath: _rdbSearch } = await import('../memory/memory-initializer.js');
+      const dbPathSearch = _rdbSearch(ctx.flags.path as string | undefined);
       const useSmart = (ctx.flags.smart || ctx.flags.s) as boolean;
 
       let results: { key: string; score: number; namespace: string; preview: string }[];
@@ -346,9 +386,29 @@ const searchCommand: Command = {
       let smartStats: Record<string, unknown> | undefined;
       let backendLabel = 'HNSW + sql.js';
 
+      // #1846: feature-detect smartSearch — older published builds of
+      // @claude-flow/memory don't expose it. Fall through to plain
+      // semantic search with a one-line warning instead of throwing.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let smartSearchFn: any | undefined;
       if (useSmart) {
-        const { smartSearch } = await import('@claude-flow/memory');
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const memMod: any = await import('@claude-flow/memory');
+          if (typeof memMod.smartSearch === 'function') {
+            smartSearchFn = memMod.smartSearch;
+          }
+        } catch {
+          /* memory package not loadable */
+        }
+        if (!smartSearchFn) {
+          output.printWarning(
+            'Smart search requested but smartSearch is not available on the installed @claude-flow/memory build (#1846). Falling back to standard semantic search.',
+          );
+        }
+      }
 
+      if (useSmart && smartSearchFn) {
         // Adapt searchEntries to the SearchFn interface
         const rawSearch = async (req: { query: string; namespace?: string; limit?: number; threshold?: number }) => {
           const r = await searchEntries({
@@ -356,6 +416,7 @@ const searchCommand: Command = {
             namespace: req.namespace || namespace,
             limit: req.limit || limit * 3,
             threshold: req.threshold ?? threshold,
+            dbPath: dbPathSearch,
           });
           return {
             results: r.results.map(e => ({
@@ -368,14 +429,14 @@ const searchCommand: Command = {
           };
         };
 
-        const smartResult = await smartSearch(rawSearch, {
+        const smartResult = await smartSearchFn(rawSearch, {
           query,
           namespace,
           limit,
           threshold,
         });
 
-        results = smartResult.results.map(r => ({
+        results = smartResult.results.map((r: { content: string; key: string; namespace: string; score: number }) => ({
           key: r.key,
           score: r.score,
           namespace: r.namespace,
@@ -389,7 +450,8 @@ const searchCommand: Command = {
           query,
           namespace,
           limit,
-          threshold
+          threshold,
+          dbPath: dbPathSearch
         });
 
         if (!searchResult.success) {
@@ -470,7 +532,8 @@ const listCommand: Command = {
       description: 'Maximum entries',
       type: 'number',
       default: 20
-    }
+    },
+    DB_PATH_OPTION
   ],
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     const namespace = ctx.flags.namespace as string;
@@ -478,8 +541,9 @@ const listCommand: Command = {
 
     // Use sql.js directly for consistent data access
     try {
-      const { listEntries } = await import('../memory/memory-initializer.js');
-      const listResult = await listEntries({ namespace, limit, offset: 0 });
+      const { listEntries, resolveDbPath: _rdbList } = await import('../memory/memory-initializer.js');
+      const dbPathList = _rdbList(ctx.flags.path as string | undefined);
+      const listResult = await listEntries({ namespace, limit, offset: 0, dbPath: dbPathList });
 
       if (!listResult.success) {
         output.printError(`Failed to list: ${listResult.error}`);
@@ -576,7 +640,8 @@ const deleteCommand: Command = {
       description: 'Skip confirmation',
       type: 'boolean',
       default: false
-    }
+    },
+    DB_PATH_OPTION
   ],
   examples: [
     { command: 'claude-flow memory delete -k "mykey"', description: 'Delete entry with default namespace' },
@@ -608,8 +673,9 @@ const deleteCommand: Command = {
 
     // Use sql.js directly for consistent data access (Issue #980)
     try {
-      const { deleteEntry } = await import('../memory/memory-initializer.js');
-      const result = await deleteEntry({ key, namespace });
+      const { deleteEntry, resolveDbPath: _rdbDelete } = await import('../memory/memory-initializer.js');
+      const dbPathDelete = _rdbDelete(ctx.flags.path as string | undefined);
+      const result = await deleteEntry({ key, namespace, dbPath: dbPathDelete });
 
       if (!result.success) {
         output.printError(result.error || 'Failed to delete');
@@ -635,11 +701,13 @@ const deleteCommand: Command = {
 const statsCommand: Command = {
   name: 'stats',
   description: 'Show memory statistics',
+  options: [DB_PATH_OPTION],
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     // Call MCP memory/stats tool for real statistics
     try {
       const statsResult = await callMCPTool('memory_stats', {}) as {
         totalEntries: number;
+        entriesWithEmbeddings?: number;
         totalSize: string;
         version: string;
         backend: string;
@@ -700,6 +768,81 @@ const statsCommand: Command = {
           { metric: 'Newest Entry', value: stats.newestEntry || 'N/A' }
         ]
       });
+
+      // #1622 — Surface the active embedding provider in `memory stats` so
+      // users can tell which backend resolved at runtime (the 6-level
+      // fallback chain in loadEmbeddingModel ranges from full ONNX to a
+      // 128-dim hash that has no semantic understanding). Calling
+      // loadEmbeddingModel() is cheap when the model is already cached;
+      // a fresh call still resolves quickly because we only need the
+      // metadata, not a real embedding.
+      try {
+        const { loadEmbeddingModel, getHNSWStatus } = await import('../memory/memory-initializer.js');
+        const embedding = await loadEmbeddingModel({ verbose: false });
+        const hnsw = getHNSWStatus();
+        // Map model name → semantic capability so users can spot the
+        // hash-fallback case without reading docs.
+        const semanticProviders = new Set([
+          'Xenova/all-MiniLM-L6-v2',
+          'Xenova/all-mpnet-base-v2',
+          'Xenova/bge-small-en-v1.5',
+          'agentic-flow',
+          'agentic-flow/reasoningbank',
+          'ruvector/onnx',
+          'cached',
+        ]);
+        const isSemantic = embedding.success && semanticProviders.has(embedding.modelName);
+
+        output.writeln();
+        output.writeln(output.bold('Embedding'));
+        output.printTable({
+          columns: [
+            { key: 'metric', header: 'Metric', width: 20 },
+            { key: 'value', header: 'Value', width: 30, align: 'right' }
+          ],
+          data: [
+            {
+              metric: 'Provider',
+              value: embedding.success
+                ? embedding.modelName
+                : output.warning(`unavailable: ${embedding.error || 'unknown'}`),
+            },
+            { metric: 'Dimensions', value: String(embedding.dimensions) },
+            {
+              metric: 'Semantic Search',
+              value: isSemantic
+                ? output.success('yes')
+                : output.warning('no — using hash fallback'),
+            },
+            {
+              metric: 'HNSW Index',
+              // ruflo#1989 / #1987: `hnsw.entryCount` is in-process JS state
+              // (the live HNSW index of the current Node process). A fresh
+              // `memory stats` invocation has never indexed anything, so it
+              // reports 0 even when the persistent DB has thousands of
+              // entries with embeddings. Use the persistent count from the
+              // MCP tool (`entriesWithEmbeddings`, which is the actual
+              // count of rows that have a vector) as the source of truth.
+              value: (() => {
+                const persisted = typeof statsResult.entriesWithEmbeddings === 'number'
+                  ? statsResult.entriesWithEmbeddings
+                  : null;
+                const live = hnsw.entryCount || 0;
+                const total = persisted !== null ? Math.max(persisted, live) : live;
+                if (!hnsw.available) return output.dim('not active');
+                if (total === 0) return output.warning('available but not initialized');
+                return output.success(`active (${total.toLocaleString()} entries)`);
+              })(),
+            },
+          ]
+        });
+      } catch (e) {
+        // Don't fail the whole stats command if introspection breaks —
+        // the rest of the dashboard is still useful.
+        output.writeln();
+        output.writeln(output.bold('Embedding'));
+        output.printInfo(`Provider info unavailable: ${e instanceof Error ? e.message : String(e)}`);
+      }
 
       output.writeln();
       output.printInfo('V3 Performance: 150x-12,500x faster search with HNSW indexing');
@@ -1336,6 +1479,13 @@ const initMemoryCommand: Command = {
         spinner.fail('Initialization failed');
         output.printError(result.error || 'Unknown error');
         return { success: false, exitCode: 1 };
+      }
+
+      // #1791.6 — DB already initialized and --force not passed: friendly no-op.
+      if (result.alreadyExists) {
+        spinner.succeed(`Memory database already initialized at ${result.dbPath}`);
+        output.printInfo('Use `--force` to reinitialize from scratch (destructive).');
+        return { success: true, exitCode: 0 };
       }
 
       spinner.succeed('Schema initialized');
