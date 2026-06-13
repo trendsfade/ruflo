@@ -591,7 +591,7 @@ Hooks execute with user permissions. Recommendations:
 - SDK Tools Types: `sdk-tools.d.ts`
 - ADR-017: RuVector Integration Architecture
 - ADR-004: Plugin-Based Architecture
-- Official Docs: https://docs.anthropic.com/en/docs/claude-code
+- Official Docs: [Claude Code Documentation](https://docs.anthropic.com/en/docs/claude-code)
 
 ---
 
